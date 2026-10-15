@@ -1,6 +1,15 @@
-# TaiYang Multi Image Loader
+# TaiYang Multi Image / Audio Loader
 
-一个 ComfyUI 自定义节点：在单一节点内管理最多 16 张参考图，并**自动连线**到下游的多图接入节点。
+一套 ComfyUI 自定义节点：在单一节点内管理参考图或参考音频，并**自动连线**到下游的多图 / 多音频接入节点。
+
+> **这两个节点主要为 MiniMax H3 与 Qwen Image 2.1 服务。**
+> 有了它们，给 H3 / Qwen 喂多张参考图（音频）不需要再串一长串加载节点，
+> 放好图就会自动接到对应的多图参考槽位上。
+
+| 节点 | 用途 | 数量上限 |
+|---|---|---|
+| **Multi Image Loader** | 多图参考 + 尺寸缩放 | 最多 16 张 |
+| **Multi Audio Loader** | 多音频参考 | 最多 8 个 |
 
 ## 功能
 
@@ -50,11 +59,17 @@
 - 拖动中可随时改变目标位置，动画连贯衔接
 
 ### 多音频加载（Multi Audio Loader）
-同包内第二个节点，功能与多图节点一致，只是把图片换成音频：
+同包内第二个节点，专门给 **MiniMax H3** 喂参考音频。功能与多图节点一致，只是把图片换成音频。
 
-- 单节点最多 **8 个音频**，网格布局，格子内显示音符图标 + 文件名
-- **拖拽排序**：按住拖动实时让位，松手后顺序落盘、连线自动跟随
-- **自动连线**：连到各多音频参考节点（见下表），空音频槽返回 `None`
+**能力：**
+
+| 能力 | 说明 |
+|---|---|
+| 多音频管理 | 单节点最多 **8 个音频**，网格布局，格子里显示音符图标 + 文件名 |
+| 拖拽排序 | 按住拖动实时让位，松手后顺序落盘、连线自动跟随 |
+| 自动连线 | 自动接到下游多音频参考节点，无需手动连线 |
+| 输出槽 | `audio_1` ~ `audio_8`，数量跟随音频数动态变化 |
+| 空槽安全 | 没有音频的槽返回 `None`，不会把无效音频喂进模型 |
 
 **音频自动连线目标：**
 
@@ -63,8 +78,12 @@
 | `MiniMaxH3ReferenceToVideo` | TemplatePrefix（0 基，autogrow 动态槽） | `ref_audios.ref_audio_0` |
 | `MiniMaxH3MaterialPromptStar7` | 固定槽位 | `ref_audio_0` / `ref_audio_1` / `ref_audio_2` |
 
+> 自动发现只认 `ref_audios` 组，**不会误连** H3 上的 `ref_video_audios`（那是参考视频的原声）。
+
+**技术细节：**
 - 音频经 ComfyUI 的 `/upload/image` 端点上传（唯一通用上传端点），落到 `input/` 目录
 - 后端用 `torchaudio` 加载，输出 `{"waveform": ..., "sample_rate": ...}`，与内置 LoadAudio 节点一致
+- 非图像类功能（缩放）仅多图节点提供，音频节点不带缩放
 
 ## 安装
 
@@ -97,12 +116,16 @@ git clone https://github.com/winchao110/TaiYang_MultiImage.git
 
 ## 依赖
 
-ComfyUI 本身已包含全部依赖（`numpy`、`torch`、`Pillow`、`folder_paths`），无需额外安装。
+ComfyUI 本身已包含全部依赖，无需额外安装：
+
+- 多图节点：`numpy`、`torch`、`Pillow`、`folder_paths`
+- 多音频节点：额外用到 `torchaudio`（ComfyUI 音频功能自带）
 
 ## 兼容性
 
 - ComfyUI 1.5x 及以上（前端 autogrow API）
 - 纯前端扩展 + 后端节点，无外部服务依赖
+- 节点可正常**折叠**与**手动缩放**，自绘控件不会溢出到节点框外
 
 ## 已知限制
 

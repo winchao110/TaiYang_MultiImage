@@ -969,6 +969,14 @@ app.registerExtension({
       // 若继续画，网格与底部条会跑到节点框外的画布上（节点只剩一条标题栏）。
       if (isCollapsed(this)) return;
 
+      // 节点被手动缩小后，本节点的布局常量（NODE_W/NODE_H）会大于实际尺寸，
+      // 自绘内容就会溢出到节点框外。这里用 clip 把整个自绘限制在节点真实范围内，
+      // 无论节点被缩到多小都不会画到框外。收尾在末尾 restore。
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, 0, this.size[0], this.size[1]);
+      ctx.clip();
+
       const images = this._qwenImages || [];
       const { cell, gap, cols, startX, startY } = GRID;
       this._gridPos = { ...GRID };
@@ -1306,33 +1314,47 @@ app.registerExtension({
       ctx.closePath();
       ctx.fill();
       ctx.textBaseline = "alphabetic";
+
+      // 解除上面设置的裁剪（见函数开头的 clip）
+      ctx.restore();
     }
 
 /** 底部模式条的命中判定 */
 const barAt = function (node, pos) {
   const b = node._modeBar;
-  if (!b) return false;
+  if (!b || !withinNode(node, pos)) return false;
   return pos[0] >= b.x && pos[0] <= b.x + b.w && pos[1] >= b.y && pos[1] <= b.y + b.h;
+};
+
+/**
+ * 命中判定的前置条件：坐标必须落在节点真实范围内。
+ * 节点被手动缩小后，布局常量算出的格子/控制条可能已在框外，此时不能响应点击。
+ */
+const withinNode = function (node, pos) {
+  if (isCollapsed(node)) return false;
+  const w = node?.size?.[0] ?? 0;
+  const h = node?.size?.[1] ?? 0;
+  return pos[0] >= 0 && pos[0] <= w && pos[1] >= 0 && pos[1] <= h;
 };
 
 /** 底部缩放条的命中判定 */
 const scaleBarAt = function (node, pos) {
   const b = node._scaleBar;
-  if (!b) return false;
+  if (!b || !withinNode(node, pos)) return false;
   return pos[0] >= b.x && pos[0] <= b.x + b.w && pos[1] >= b.y && pos[1] <= b.y + b.h;
 };
 
 /** 缩放条左半区（百万像素）命中判定 */
 const scaleMpZoneAt = function (node, pos) {
   const b = node._scaleMpZone;
-  if (!b) return false;
+  if (!b || !withinNode(node, pos)) return false;
   return pos[0] >= b.x && pos[0] <= b.x + b.w && pos[1] >= b.y && pos[1] <= b.y + b.h;
 };
 
 /** 缩放条右半区（分辨率倍数）命中判定 */
 const scaleStepsZoneAt = function (node, pos) {
   const b = node._scaleStepsZone;
-  if (!b) return false;
+  if (!b || !withinNode(node, pos)) return false;
   return pos[0] >= b.x && pos[0] <= b.x + b.w && pos[1] >= b.y && pos[1] <= b.y + b.h;
 };
 
@@ -1365,6 +1387,7 @@ const editScale = function (node, zone) {
     // ------------------------------------------------------------ 鼠标
     /** 格子命中判定：图片格 0..n-1，加号格固定是 n */
     const cellAt = function (node, pos) {
+      if (!withinNode(node, pos)) return -1;
       const { cell, gap, cols, startX, startY } = GRID;
       const n = (node._qwenImages || []).length;
       const total = n < MAX_IMAGES ? n + 1 : n;

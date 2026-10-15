@@ -733,6 +733,13 @@ app.registerExtension({
       // 若继续画，网格与底部条会跑到节点框外的画布上（节点只剩一条标题栏）。
       if (isCollapsed(this)) return;
 
+      // 节点被手动缩小后，布局常量（NODE_W/NODE_H）会大于实际尺寸，
+      // 自绘内容就会溢出到节点框外。这里 clip 到节点真实范围，收尾 restore。
+      ctx.save();
+      ctx.beginPath();
+      ctx.rect(0, 0, this.size[0], this.size[1]);
+      ctx.clip();
+
       const audios = this._audios || [];
       const { cell, gap, cols, startX, startY } = GRID;
       this._gridPos = { ...GRID };
@@ -912,18 +919,33 @@ app.registerExtension({
       ctx.closePath();
       ctx.fill();
       ctx.textBaseline = "alphabetic";
+
+      // 解除上面设置的裁剪（见函数开头的 clip）
+      ctx.restore();
     }
+
+    /**
+     * 命中判定的前置条件：坐标必须落在节点真实范围内。
+     * 节点被手动缩小后，布局常量算出的格子/控制条可能已在框外，此时不能响应点击。
+     */
+    const withinNode = function (node, pos) {
+      if (isCollapsed(node)) return false;
+      const w = node?.size?.[0] ?? 0;
+      const h = node?.size?.[1] ?? 0;
+      return pos[0] >= 0 && pos[0] <= w && pos[1] >= 0 && pos[1] <= h;
+    };
 
     /** 底部模式条的命中判定 */
     const barAt = function (node, pos) {
       const b = node._modeBar;
-      if (!b) return false;
+      if (!b || !withinNode(node, pos)) return false;
       return pos[0] >= b.x && pos[0] <= b.x + b.w && pos[1] >= b.y && pos[1] <= b.y + b.h;
     };
 
     // ------------------------------------------------------------ 鼠标
     /** 格子命中判定：音频格 0..n-1，加号格固定是 n */
     const cellAt = function (node, pos) {
+      if (!withinNode(node, pos)) return -1;
       const { cell, gap, cols, startX, startY } = GRID;
       const n = (node._audios || []).length;
       const total = n < MAX_AUDIOS ? n + 1 : n;
