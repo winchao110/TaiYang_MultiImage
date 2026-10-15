@@ -99,13 +99,22 @@ const NODE_H = WIDGET_TOP_GAP + SCALE_BAR_H + BAR_H + BAR_GAP * 2 + 10;
 
 // 底部两条控件的总占用高度（缩放条 + auto_link 条 + 两个间距）
 const BOTTOM_BLOCK_H = SCALE_BAR_H + BAR_H + BAR_GAP * 2;
-/**
- * 节点最小尺寸：底部控件不能互相覆盖，也不能压到网格上。
- * 宽度下限保证底部两条控件都有足够横向空间；
- * 高度下限 = 网格底部 + 控件区，保证控件与图片不重叠。
- */
-const MIN_NODE_H = WIDGET_TOP_GAP + BOTTOM_BLOCK_H;
+// 节点最小宽度：保证底部两条控件有足够横向空间
 const MIN_NODE_W = 320;
+
+/**
+ * 按**实际已用行数**算最小高度。
+ * 网格只画到有内容的那几行，所以图片少时节点可以缩得很矮——
+ * 只要「已用网格 + 底部控件区」能放下就行，不遮挡当前已有的图片。
+ */
+function minHeightFor(node) {
+  const n = (node?._qwenImages || []).length;
+  // 有图就多留一个加号格的位置（加号固定排在所有图片后面）
+  const slots = n < MAX_IMAGES ? n + 1 : n;
+  const rows = Math.max(1, Math.ceil(slots / COLS));
+  const gridH = rows * CELL + (rows - 1) * GAP;
+  return HEADER_H + gridH + BOTTOM_BLOCK_H;
+}
 
 /**
  * 底部控件布局：**贴着节点实际底边往上排**。
@@ -119,14 +128,15 @@ function bottomLayout(nodeH) {
 }
 
 /**
- * 钳制节点尺寸到最小值。
- * 缩得太小会让底部两条控件与网格重叠（控件互相覆盖），所以这里兜一个下限。
+ * 钳制节点尺寸：宽度不低于 MIN_NODE_W，高度不低于「已用网格 + 控件区」。
+ * 这样既能自由缩小（图片少时），又保证控件不会盖住已有图片。
  */
 function clampNodeSize(node) {
   const s = node?.size;
   if (!s) return node;
   if (!(s[0] >= MIN_NODE_W)) s[0] = MIN_NODE_W;
-  if (!(s[1] >= MIN_NODE_H)) s[1] = MIN_NODE_H;
+  const minH = minHeightFor(node);
+  if (!(s[1] >= minH)) s[1] = minH;
   return node;
 }
 
@@ -338,6 +348,12 @@ function setImages(node, files) {
   list.forEach((name, i) => {
     node._qwenImgCache[i] = makeThumb(name);
   });
+  // 图片增删后最小高度会变（按已用行数），重新钳一次。
+  // 删图后如果节点比新的下限还矮要顶回去；
+  // 加图后如果节点不够高也要跟着长出来，否则新图会被底部控件挡住。
+  const minH = minHeightFor(node);
+  if (node.size && node.size[1] < minH) node.size[1] = minH;
+  if (node.size && node.size[0] < MIN_NODE_W) node.size[0] = MIN_NODE_W;
   node.setDirtyCanvas(true, true);
 }
 
@@ -854,11 +870,12 @@ app.registerExtension({
       const linkedCount = (this.outputs || []).filter((o) => (o.links || []).length > 0).length;
       syncOutputSlots(this, Math.max(files.length, linkedCount));
 
-      // 老工作流存的是旧的节点尺寸（没留输出槽标签的位置），这里强制拉齐，
-      // 否则载入后右侧标签仍会压在图片上；同时钳住最小尺寸，避免控件重叠。
+      // 老工作流可能存着过窄的宽度（没留输出槽标签的位置），这里强制拉齐宽度，
+      // 否则载入后右侧标签仍会压在图片上。
+      // 高度**不**按NODE_H 拉满：最小高度是动态的（按已用行数），
+      // 图片少时节点应该允许更矮，多余空间留着反而空。clampNodeSize 负责兜下限。
       clampNodeSize(this);
       if (this.size[0] < NODE_W) this.size[0] = NODE_W;
-      if (this.size[1] < NODE_H) this.size[1] = NODE_H;
       this.setDirtyCanvas?.(true, true);
 
       // 载入后按已保存的连线重建一次缺失的槽位

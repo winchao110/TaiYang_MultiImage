@@ -82,11 +82,22 @@ const BAR_H = 24;
 const BAR_GAP = 6;
 // 底部控件区总高度
 const BOTTOM_BLOCK_H = BAR_H + BAR_GAP * 2;
-/**
- * 节点最小尺寸：底部控件不能压到网格上，也不能互相重叠。
- */
-const MIN_NODE_H = WIDGET_TOP_GAP + BOTTOM_BLOCK_H;
+// 节点最小宽度
 const MIN_NODE_W = 320;
+
+/**
+ * 按**实际已用行数**算最小高度。
+ * 网格只画到有内容的那几行，所以音频少时节点可以缩得很矮——
+ * 只要「已用网格 + 底部控件区」能放下就行，不遮挡当前已有的音频。
+ */
+function minHeightFor(node) {
+  const n = (node?._audios || []).length;
+  // 有音频就多留一个加号格的位置（加号固定排在所有音频后面）
+  const slots = n < MAX_AUDIOS ? n + 1 : n;
+  const rows = Math.max(1, Math.ceil(slots / COLS));
+  const gridH = rows * CELL + (rows - 1) * GAP;
+  return HEADER_H + gridH + BOTTOM_BLOCK_H;
+}
 
 /**
  * 底部 auto_link 条布局：**贴着节点实际底边往上排**。
@@ -97,14 +108,15 @@ function bottomLayout(nodeH) {
 }
 
 /**
- * 钳制节点尺寸到最小值。
- * 缩得太小会让底部控件压到网格上（控件相互覆盖），所以这里兜一个下限。
+ * 钳制节点尺寸：宽度不低于 MIN_NODE_W，高度不低于「已用网格 + 控件区」。
+ * 这样既能自由缩小（音频少时），又保证控件不会盖住已有音频。
  */
 function clampNodeSize(node) {
   const s = node?.size;
   if (!s) return node;
   if (!(s[0] >= MIN_NODE_W)) s[0] = MIN_NODE_W;
-  if (!(s[1] >= MIN_NODE_H)) s[1] = MIN_NODE_H;
+  const minH = minHeightFor(node);
+  if (!(s[1] >= minH)) s[1] = minH;
   return node;
 }
 
@@ -200,6 +212,11 @@ function setAudios(node, files) {
   const w = getWidget(node, "audio_files");
   if (w) w.value = JSON.stringify(list);
   node._audios = list.slice();
+  // 音频增删后最小高度会变（按已用行数），重新钳一次：
+  // 删音频后要顶回去，加音频后要跟着长出来，否则控件会挡住内容。
+  const minH = minHeightFor(node);
+  if (node.size && node.size[1] < minH) node.size[1] = minH;
+  if (node.size && node.size[0] < MIN_NODE_W) node.size[0] = MIN_NODE_W;
   node.setDirtyCanvas(true, true);
 }
 
@@ -653,10 +670,11 @@ app.registerExtension({
       const linkedCount = (this.outputs || []).filter((o) => (o.links || []).length > 0).length;
       syncOutputSlots(this, Math.max(this._audios.length, linkedCount));
 
-      // 同时钳住最小尺寸，避免底部控件压到网格上
+      // 老工作流可能存着过窄的宽度，这里强制拉齐宽度；
+      // 高度不按 NODE_H 拉满——最小高度是动态的（按已用行数），
+      // 音频少时节点应该允许更矮。clampNodeSize 负责兜下限。
       clampNodeSize(this);
       if (this.size[0] < NODE_W) this.size[0] = NODE_W;
-      if (this.size[1] < NODE_H) this.size[1] = NODE_H;
       this.setDirtyCanvas?.(true, true);
 
       setTimeout(() => syncConnections(this), 0);
