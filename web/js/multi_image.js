@@ -151,13 +151,20 @@ function setUpscaleMethod(node, m) {
   node.setDirtyCanvas?.(true, true);
 }
 
-/** 分辨率倍数（对齐步长）。默认 32，可任意填数字 */
+/**
+ * 分辨率倍数（对齐步长）。**默认 32**，可任意填数字。
+ * widget 缺失时（老工作流）主动补成 32，并写回 widget，
+ * 保证界面显示、缩放计算、后端取参三处始终一致。
+ */
 const DEFAULT_STEPS = 32;
 
 function getResolutionSteps(node) {
   const w = getWidget(node, "resolution_steps");
   const v = Math.round(Number(w?.value));
-  return Number.isFinite(v) && v >= 1 ? v : DEFAULT_STEPS;
+  if (Number.isFinite(v) && v >= 1) return v;
+  // widget 不存在或值非法：补默认值并写回，避免下次再读还是错的
+  if (w) w.value = DEFAULT_STEPS;
+  return DEFAULT_STEPS;
 }
 
 function setResolutionSteps(node, n) {
@@ -1334,7 +1341,7 @@ const editScale = function (node, zone) {
   }
   const curSteps = getResolutionSteps(node);
   const v = promptNumber(
-    "分辨率倍数：宽高将对齐到该数字的整数倍\n例如 32 表示宽高都是 32 的倍数",
+    `分辨率对齐整数倍（默认 ${DEFAULT_STEPS}，范围 1~256）\n宽高会对齐到该数字的整数倍`,
     curSteps,
     { min: 1, max: 256, integer: true }
   );

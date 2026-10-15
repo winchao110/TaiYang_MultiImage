@@ -32,10 +32,10 @@ class TaiYangMultiImageLoader:
                 "upscale_method": (["nearest-exact", "bilinear", "area", "bicubic", "lanczos"], {"default": "bilinear"}),
                 # 0 = 不缩放（保持原分辨率）。>0 时按总像素数等比缩放，可填任意数字。
                 "megapixels": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 16.0, "step": 0.01}),
-            },
-            "optional": {
-                # 分辨率对齐步长：宽高都对齐到该数字的整数倍
-                "resolution_steps": ("INT", {"default": 32, "min": 1, "max": 256, "advanced": True}),
+                # 分辨率对齐步长：宽高都对齐到该数字的整数倍。
+                # 放 required 而不是 optional+advanced：这个参数要在画布上直接改，
+                # 放 optional 时前端可能拿不到 widget，界面会显示错误值。
+                "resolution_steps": ("INT", {"default": 32, "min": 1, "max": 256}),
             },
         }
 
