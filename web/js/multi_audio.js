@@ -217,7 +217,213 @@ function setAudios(node, files) {
   const minH = minHeightFor(node);
   if (node.size && node.size[1] < minH) node.size[1] = minH;
   if (node.size && node.size[0] < MIN_NODE_W) node.size[0] = MIN_NODE_W;
+  // 音频列表变了：清掉已不存在文件的裁剪区间与缓存，避免残留脏数据
+  pruneTrims(node);
   node.setDirtyCanvas(true, true);
+}
+
+// ---------------------------------------------------------------- 音频区间裁剪 + 试听
+//
+// 每条音频有一个可选裁剪区间 [start, end]（秒）：
+//   - 不裁剪时 end = null，表示到结尾
+//   - 前端在格子里画两条竖线，拖动改区间；**end 必须 > start**
+//   - 状态存trims widget（[{"n":文件名,"s":起始,"e":结束}, ...]），
+//     后端执行时按这个区间切片。
+//   - 点格子试听：从 start 播到 end，再点停止。
+
+/** 读全部裁剪区间，返回 {文件名: {s, e}} */
+function readTrims(node) {
+  const w = getWidget(node, "trims");
+  const out = {};
+  if (!w) return out;
+  let raw;
+  try {
+    raw = JSON.parse(w.value || "[]");
+  } catch {
+    return out;
+  }
+  if (!Array.isArray(raw)) return out;
+  for (const it of raw) {
+    if (it && typeof it.n === "string") {
+      const s = Number(it.s) || 0;
+      let e = it.e == null ? null : Number(it.e);
+      if (e != null && !Number.isFinite(e)) e = null;
+      out[it.n] = { s, e };
+    }
+  }
+  return out;
+}
+
+/** 写回裁剪区间 */
+function writeTrims(node, map) {
+  const w = getWidget(node, "trims");
+  if (!w) return;
+  const arr = Object.entries(map).map(([n, t]) => ({ n, s: t.s, e: t.e }));
+  w.value = JSON.stringify(arr);
+}
+
+/** 取某条音频的区间（没有则给整段 0~null） */
+function trimOf(node, name) {
+  return readTrims(node)[name] || { s: 0, e: null };
+}
+
+/**
+ * 设置某条音频的裁剪区间，并强制 end > start。
+ * @param {number|null} end 传 null 表示「到结尾」
+ * @returns {{s:number,e:number|null}} 实际生效的区间
+ */
+function setTrim(node, name, start, end, duration) {
+  const dur = duration && duration > 0 ? duration : null;
+  let s = Math.max(0, Number(start) || 0);
+  let e = end == null ? null : Number(end);
+  if (dur) s = Math.min(s, dur);
+  if (e != null) {
+    e = Math.max(0, e);
+    if (dur) e = Math.min(e, dur);
+    // 结束必须在开始之后；否则顶到 start + 一个最小可见量（或到结尾）
+    if (e <= s) {
+      e = dur != null && s + 0.05 < dur ? s + 0.05 : dur;
+      if (e != null && e <= s) e = null; // 到结尾仍不合法就退回整段
+    }
+  }
+  const map = readTrims(node);
+  if (s <= 0 && e == null) delete map[name];
+  else map[name] = { s, e };
+  writeTrims(node, map);
+  node.setDirtyCanvas?.(true, true);
+  return { s, e };
+}
+
+/** 音频列表变化后，丢掉已不存在文件的区间 */
+function pruneTrims(node) {
+  const w = getWidget(node, "trims");
+  if (!w) return;
+  const map = readTrims(node);
+  const alive = new Set(node._audios || []);
+  let changed = false;
+  for (const n of Object.keys(map)) {
+    if (!alive.has(n)) {
+      delete map[n];
+      changed = true;
+    }
+  }
+  if (changed) writeTrims(node, map);
+}
+
+// ---------------------------------------------------------------- 时长 / 试听
+
+/**
+ * 取音频时长（秒）。用 HTMLAudioElement 读 metadata，不解码整段，开销小。
+ * 结果缓存在 node._durations[name]，避免重复加载。
+ */
+function getDuration(node, name) {
+  const cache = (node._durations ||= {});
+  if (cache[name] != null) return Promise.resolve(cache[name]);
+  return new Promise((resolve) => {
+    const el = new Audio();
+    let done = false;
+    const finish = (v) => {
+      if (done) return;
+      done = true;
+      cache[name] = v;      // null 表示读不到
+      el.src = "";
+      resolve(v);
+    };
+    el.preload = "metadata";
+    el.onloadedmetadata = () => {
+      const d = el.duration;
+      finish(Number.isFinite(d) && d > 0 ? d : null);
+    };
+    el.onerror = () => finish(null);
+    // 兜底：有些环境不触发事件，2 秒后按未知处理
+    setTimeout(() => finish(cache[name] ?? null), 2000);
+    el.src = audioUrl(name);
+  });
+}
+
+/** 音频访问 URL（与上传接口的 type=input 对应） */
+function audioUrl(name) {
+  return `/api/view?filename=${encodeURIComponent(name)}&type=input`;
+}
+
+/** 正在试听的 {name, start, end, el} */
+let previewing = null;
+
+/**
+ * 试听：从 start 播到 end。
+ * 已在试听同一条-> 停止；试听别的 -> 先停旧的再播新的。
+ *
+ * 用定时器轮询播放头来判定「到终点」，比 el.onended 可靠——
+ * 设了裁剪终点时我们不修改 src，只能靠 currentTime 判断。
+ * @returns {boolean} 是否成功开始试听
+ */
+function togglePreview(node, name) {
+  const t = trimOf(node, name);
+  if (previewing && previewing.name === name) {
+    stopPreview();
+    return false;
+  }
+  stopPreview();
+
+  const el = new Audio();
+  el.src = audioUrl(name);
+  el.currentTime = Math.max(0, t.s);
+  const entry = { name, start: t.s, end: t.e, el, timer: null };
+  previewing = entry;
+
+  // 轮询：越过终点就停
+  entry.timer = setInterval(() => {
+    if (!previewing || previewing !== entry) return;
+    const cur = el.currentTime || 0;
+    // end 为 null 表示放到结尾，靠 ended 事件收尾
+    if (entry.end != null && cur >= entry.end - 0.02) {
+      stopPreview();
+      return;
+    }
+    // 播放头移动 -> 重绘（播放头/ 时间显示）
+    node.setDirtyCanvas?.(true, true);
+  }, 60);
+
+  el.onended = () => {
+    if (previewing === entry) stopPreview();
+  };
+  el.onerror = () => stopPreview();
+
+  const p = el.play();
+  if (p && typeof p.catch === "function") {
+    p.catch(() => stopPreview());
+  }
+  node._playing = name;
+  node.setDirtyCanvas?.(true, true);
+  return true;
+}
+
+/** 停止试听 */
+function stopPreview() {
+  if (!previewing) return;
+  const e = previewing;
+  previewing = null;
+  if (e.timer) {
+    clearInterval(e.timer);
+    e.timer = null;
+  }
+  try {
+    e.el.pause();
+    e.el.currentTime = 0;
+    e.el.src = "";
+  } catch {
+    /* 忽略：停止失败无所谓 */
+  }
+  // 清掉所有节点上的播放标记
+  const g = window.app?.graph;
+  if (g?._nodes) {
+    for (const n of g._nodes) {
+      if (n._playing) {
+        n._playing = null;
+        n.setDirtyCanvas?.(true, true);
+      }
+    }
+  }
 }
 
 // ---------------------------------------------------------------- autogrow 槽位管理
@@ -639,18 +845,25 @@ app.registerExtension({
       // auto_link / audio_files 两个 widget 都设 hidden：widget 会生成 DOM 覆盖层
       // 挡住网格，所以外观由 onDrawForeground 自绘，点击由 onMouseDown 处理。
       // widget 仍留在 widgets 数组里，后端按名字取值。
-      const filesWidget = getWidget(this, "audio_files");
-      if (filesWidget) {
-        filesWidget.dontHide = true;
-        filesWidget.hidden = true;
-        filesWidget.computeSize = () => [0, 0];
-        filesWidget.draw = () => {};
-      }
+      // trims（裁剪区间）同样 hidden：它是内部状态，不该直接暴露给用户编辑。
+      const hideWidget = (name) => {
+        const w = getWidget(this, name);
+        if (!w) return;
+        w.dontHide = true;
+        w.hidden = true;
+        w.computeSize = () => [0, 0];
+        w.draw = () => {};
+      };
+      hideWidget("audio_files");
+      hideWidget("trims");
       if (modeWidget) {
         modeWidget.hidden = true;
         modeWidget.computeSize = () => [0, 0];
         modeWidget.draw = () => {};
       }
+
+      // 异步读取每条音频的时长（画竖线要用）
+      (this._audios || []).forEach((n) => getDuration(this, n));
 
       return r;
     };
@@ -666,6 +879,15 @@ app.registerExtension({
       }
       this._audioManualTarget = this.properties?.auto_link_target || null;
       this._audios = getAudioFiles(this).slice();
+
+      // 裁剪区间：从 widget 读，老工作流则从 properties 兜底
+      const tw = getWidget(this, "trims");
+      if ((!tw || !tw.value || tw.value === "[]") && this.properties?.trims) {
+        if (tw) tw.value = this.properties.trims;
+      }
+      this._durations = {};
+      // 读时长，画竖线要用
+      (this._audios || []).forEach((n) => getDuration(this, n));
 
       const linkedCount = (this.outputs || []).filter((o) => (o.links || []).length > 0).length;
       syncOutputSlots(this, Math.max(this._audios.length, linkedCount));
@@ -697,6 +919,8 @@ app.registerExtension({
     nodeType.prototype.onSerialize = function () {
       if (this.properties) {
         this.properties.audio_files = getWidget(this, "audio_files")?.value ?? "[]";
+        // 保存裁剪区间，下次载入仍然生效
+        this.properties.trims = getWidget(this, "trims")?.value ?? "[]";
         if (this._audioManualTarget) this.properties.auto_link_target = this._audioManualTarget;
         else delete this.properties.auto_link_target;
       }
@@ -885,16 +1109,117 @@ app.registerExtension({
         ctx.stroke();
         ctx.setLineDash([]);
 
-        // 音频没有缩略图：画音符图标 + 文件名
-        ctx.textAlign = "center";
-        ctx.textBaseline = "middle";
-        ctx.fillStyle = isGrabbed ? "#9aa7b3" : isShifted ? "#7fe8a5" : "#8fd0ff";
-        ctx.font = `${Math.round(cell * 0.32)}px Arial`;
-        ctx.fillText("♪", x + cell / 2, y + cell / 2 - 8);
+        // ------------------------------------------------------------------
+        // 音频格子：波形区 + 两条裁剪竖线（起点 / 终点）+ 文件名
+        //
+        // 波形区内：
+        //   选中区间（start~end）高亮，两侧灰暗
+        //   两条竖线可拖动：左=起点，右=终点（终点只能在起点右边）
+        //   正在试听时显示播放头
+        // ------------------------------------------------------------------
+        const name = audios[i];
+        const trims = readTrims(this);
+        const tr = trims[name] || { s: 0, e: null };
+        const dur = (this._durations || {})[name] || 0;
+        const playing = this._playing === name;
+
+        const FILEBAR_H = 18;       // 底部文件名条
+        const waveTop = y + 26;     // 波形区上沿（留出顶部标题空间）
+        const waveH = cell - 26 - FILEBAR_H - 4;
+        const waveX = x + 8;
+        const waveW = cell - 16;
+
+        // 格子底部：区间秒数
         ctx.fillStyle = "rgba(220,230,240,0.85)";
         ctx.font = "11px Arial";
-        ctx.fillText(truncateName(audios[i], 15), x + cell / 2, y + cell - 18);
-        ctx.textBaseline = "alphabetic";
+        ctx.textAlign = "center";
+        ctx.fillText(truncateName(name, 15), x + cell / 2, y + cell - 7);
+
+        // 波形区底板
+        ctx.fillStyle = "rgba(255,255,255,0.05)";
+        ctx.beginPath();
+        ctx.roundRect(waveX, waveTop, waveW, waveH, 3);
+        ctx.fill();
+
+        if (dur > 0) {
+          // 有时长才能定位竖线
+          const sx = waveX + (tr.s / dur) * waveW;
+          const ex = tr.e != null ? waveX + (tr.e / dur) * waveW : waveX + waveW;
+
+          // 区间外灰暗、区间内高亮
+          ctx.fillStyle = "rgba(0,0,0,0.45)";
+          ctx.fillRect(waveX, waveTop, Math.max(0, sx - waveX), waveH);
+          ctx.fillRect(Math.min(ex, waveX + waveW), waveTop, Math.max(0, waveX + waveW - ex), waveH);
+          ctx.fillStyle = "rgba(143,224,143,0.16)";
+          ctx.fillRect(sx, waveTop, Math.max(0, ex - sx), waveH);
+
+          // 两条竖线
+          const dragStart = this._dragTrim?.name === name && this._dragTrim.which === "s";
+          const dragEnd = this._dragTrim?.name === name && this._dragTrim.which === "e";
+
+          // 起点线
+          ctx.strokeStyle = dragStart ? "#ffd479" : "#8fe08f";
+          ctx.lineWidth = dragStart ? 3 : 2;
+          ctx.beginPath();
+          ctx.moveTo(sx, waveTop);
+          ctx.lineTo(sx, waveTop + waveH);
+          ctx.stroke();
+          // 起点手柄（小三角）
+          ctx.fillStyle = dragStart ? "#ffd479" : "#8fe08f";
+          ctx.beginPath();
+          ctx.moveTo(sx, waveTop);
+          ctx.lineTo(sx - 5, waveTop - 7);
+          ctx.lineTo(sx + 5, waveTop - 7);
+          ctx.closePath();
+          ctx.fill();
+
+          // 终点线
+          ctx.strokeStyle = dragEnd ? "#ffd479" : "#8fd0ff";
+          ctx.lineWidth = dragEnd ? 3 : 2;
+          ctx.beginPath();
+          ctx.moveTo(ex, waveTop);
+          ctx.lineTo(ex, waveTop + waveH);
+          ctx.stroke();
+          ctx.fillStyle = dragEnd ? "#ffd479" : "#8fd0ff";
+          ctx.beginPath();
+          ctx.moveTo(ex, waveTop + waveH);
+          ctx.lineTo(ex - 5, waveTop + waveH + 7);
+          ctx.lineTo(ex + 5, waveTop + waveH + 7);
+          ctx.closePath();
+          ctx.fill();
+
+          // 试听播放头
+          if (playing && previewing) {
+            const t = Math.min(previewing.el.currentTime || 0, previewing.end ?? dur);
+            const px = waveX + ((t - tr.s) / Math.max(0.001, (tr.e ?? dur) - tr.s)) * (ex - sx);
+            if (px >= sx && px <= ex) {
+              ctx.fillStyle = "#ffd479";
+              ctx.fillRect(px - 1, waveTop, 2, waveH);
+            }
+          }
+        } else {
+          // 时长未知：画音符占位，并提示点击可试听
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.fillStyle = isGrabbed ? "#9aa7b3" : "#8fd0ff";
+          ctx.font = `${Math.round(cell * 0.26)}px Arial`;
+          ctx.fillText(playing ? "■" : "♪", x + cell / 2, waveTop + waveH / 2);
+          ctx.textBaseline = "alphabetic";
+        }
+
+        // 区间秒数（贴波形区上方右侧）
+        if (dur > 0) {
+          const seg =
+            tr.e != null
+              ? `${tr.s.toFixed(2)}s → ${tr.e.toFixed(2)}s`
+              : tr.s > 0
+                ? `${tr.s.toFixed(2)}s → 结尾`
+                : "整段";
+          ctx.fillStyle = tr.e != null || tr.s > 0 ? "#8fe08f" : "#7d8894";
+          ctx.font = "10px Arial";
+          ctx.textAlign = "right";
+          ctx.fillText(seg, x + cell - 8, waveTop - 4);
+        }
 
         // 序号角标
         ctx.fillStyle = "rgba(0,0,0,0.7)";
@@ -1006,6 +1331,58 @@ app.registerExtension({
     };
 
     // ------------------------------------------------------------ 鼠标
+    /**
+     * 裁剪竖线命中判定：返回 {index, which} 或 null。
+     * which = "s" 起点线、"e" 终点线。
+     * 命中容差 6px，两条线都命中时取更近的那条。
+     * 格子在拖拽换位时不响应。
+     */
+    const hitTrim = function (node, pos) {
+      if (node._drag) return null;
+      const { cell, gap, cols, startX, startY } = GRID;
+      const audios = node._audios || [];
+      const i = cellAt(node, pos);
+      if (i < 0 || i >= audios.length) return null;
+
+      const name = audios[i];
+      const dur = (node._durations || {})[name] || 0;
+      if (!(dur > 0)) return null;
+
+      const x = startX + (i % cols) * (cell + gap);
+      const y = startY + Math.floor(i / cols) * (cell + gap);
+      const FILEBAR_H = 18;
+      const waveTop = y + 26;
+      const waveH = cell - 26 - FILEBAR_H - 4;
+      // y 必须落在波形区内（含上下的手柄余量）
+      if (pos[1] < waveTop - 8 || pos[1] > waveTop + waveH + 8) return null;
+
+      const waveX = x + 8;
+      const waveW = cell - 16;
+      const tr = trimOf(node, name);
+      const sx = waveX + (tr.s / dur) * waveW;
+      const ex = tr.e != null ? waveX + (tr.e / dur) * waveW : waveX + waveW;
+
+      const ds = Math.abs(pos[0] - sx);
+      const de = Math.abs(pos[0] - ex);
+      const TOL = 6;
+      if (ds <= TOL && (ds <= de || de > TOL)) return { index: i, which: "s", name, dur };
+      if (de <= TOL) return { index: i, which: "e", name, dur };
+      return null;
+    };
+
+    /**
+     * 把横坐标换算成秒（限制在 0~duration）。
+     */
+    const xToSeconds = function (node, pos, index, dur) {
+      const { cell, gap, cols, startX, startY } = GRID;
+      const x = startX + (index % cols) * (cell + gap);
+      const y = startY + Math.floor(index / cols) * (cell + gap);
+      const waveX = x + 8;
+      const waveW = cell - 16;
+      const ratio = (pos[0] - waveX) / waveW;
+      return Math.max(0, Math.min(dur, ratio * dur));
+    };
+
     /** 格子命中判定：音频格 0..n-1，加号格固定是 n */
     const cellAt = function (node, pos) {
       if (!withinNode(node, pos)) return -1;
@@ -1064,6 +1441,24 @@ app.registerExtension({
       // 折叠时不更新 hover / 拖拽，自绘区域已不再显示
       if (isCollapsed(this)) return origMove?.apply(this, arguments);
 
+      // 0) 正在拖裁剪竖线：实时更新区间（终点只允许在起点右侧）
+      if (this._dragTrim) {
+        const { name, which, index, dur } = this._dragTrim;
+        const secs = xToSeconds(this, pos, index, dur);
+        const tr = trimOf(this, name);
+        if (which === "s") {
+          // 起点不能越过终点
+          const limit = tr.e != null ? tr.e - 0.01 : dur;
+          setTrim(this, name, Math.min(secs, limit), tr.e, dur);
+        } else {
+          // 终点必须严格在起点右侧
+          setTrim(this, name, tr.s, Math.max(secs, tr.s + 0.01), dur);
+        }
+        // 拖动时把播放头反馈出来
+        this.setDirtyCanvas(true, true);
+        return true;
+      }
+
       // 1) 已按下未越阈值：等越过 DRAG_THRESHOLD 才升级为拖拽（单击无动作）
       if (this._press && !this._drag) {
         const dx = pos[0] - this._press.x;
@@ -1101,11 +1496,30 @@ app.registerExtension({
         this._hoverBar = onBar;
         this.setDirtyCanvas(true, true);
       }
+
+      // 悬停在竖线上时改光标，提示可以拖动
+      if (!this._dragTrim) {
+        const onTrim = !!hitTrim(this, pos);
+        if (onTrim !== this._hoverTrim) {
+          this._hoverTrim = onTrim;
+          const c = this.canvas;
+          if (c) c.style.cursor = onTrim ? "ew-resize" : "";
+        }
+      }
       return origMove?.apply(this, arguments);
     };
 
     const origUp = nodeType.prototype.onMouseUp;
     nodeType.prototype.onMouseUp = function (e, pos) {
+      // 0) 裁剪竖线拖动结束
+      if (this._dragTrim) {
+        this._dragTrim = null;
+        // 拖完恢复光标
+        if (this.canvas) this.canvas.style.cursor = "";
+        this.setDirtyCanvas(true, true);
+        return true;
+      }
+
       // 1) 单击：静默复位
       if (this._press) {
         resetDrag(this);
@@ -1156,7 +1570,7 @@ app.registerExtension({
       const y = startY + Math.floor(i / cols) * (cell + gap);
 
       if (i < audios.length) {
-        // 右上角删除按钮
+        // 右上角删除按钮（优先于一切）
         const bx = x + cell - 16;
         const by = y + 16;
         const dx = pos[0] - bx;
@@ -1168,9 +1582,20 @@ app.registerExtension({
           syncConnections(this);
           return true;
         }
-        // 左键按住音频 -> 记录待拖拽（超过阈值才算真拖）
+
+        // 裁剪竖线：按住拖动调整起点/终点（优先级高于拖拽排序与试听）
+        const hit = hitTrim(this, pos);
+        if (hit && (e?.button === 0 || e?.button == null)) {
+          this._dragTrim = { name: hit.name, which: hit.which, index: hit.index, dur: hit.dur };
+          this._press = null;
+          this.setDirtyCanvas(true, true);
+          return true;
+        }
+
+        // 点击格子 = 试听（从起点播到终点）；再点一次停止
         if (e?.button === 0 || e?.button == null) {
-          this._press = { from: i, x: pos[0], y: pos[1] };
+          togglePreview(this, audios[i]);
+          // 试听点击不进入排序拖拽（单击无副作用）
           return true;
         }
       } else {

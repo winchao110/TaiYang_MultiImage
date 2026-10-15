@@ -134,6 +134,9 @@ class TaiYangMultiAudioLoader:
         return {
             "required": {
                 "audio_files": ("STRING", {"default": "[]", "multiline": False}),
+                # 每条音频的裁剪区间 [{"n":文件名,"s":起始秒,"e":结束秒}, ...]
+                # 前端两条竖线拖动后写入这里，执行时按区间切片。
+                "trims": ("STRING", {"default": "[]", "multiline": False}),
                 "auto_link": (["自动", "MiniMaxH3ReferenceToVideo", "MiniMaxH3MaterialPromptStar7", "关闭"], {"default": "自动"}),
             },
         }
@@ -156,7 +159,46 @@ class TaiYangMultiAudioLoader:
                 raw = []
         return [f for f in raw if isinstance(f, str) and f.strip()][:MAX_AUDIOS]
 
-    def _load_one(self, rel_path):
+    def _parse_trims(self, trims):
+        """把 trims widget 解析成 {文件名: (起始秒, 结束秒)}。
+
+        结束秒为 None 或 <= 起始秒 表示「不裁剪」，此时返回 None。
+        """
+        if isinstance(trims, (list, tuple)):
+            raw = list(trims)
+        else:
+            try:
+                raw = json.loads(trims or "[]")
+            except Exception:
+                raw = []
+            if not isinstance(raw, list):
+                raw = []
+        out = {}
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            name = item.get("n")
+            if not isinstance(name, str) or not name:
+                continue
+            try:
+                start = float(item.get("s", 0.0) or 0.0)
+            except Exception:
+                start = 0.0
+            end = item.get("e", None)
+            try:
+                end = None if end is None else float(end)
+            except Exception:
+                end = None
+            # 结束必须严格大于开始，否则这个区间非法 → 整段不裁剪
+            # （注意不能只把 end 置 None：那样 start>0 时会变成「start 到结尾」，语义就变了）
+            if end is not None and end <= start:
+                continue
+            if start <= 0 and end is None:
+                continue  # 整段，不用记
+            out[name] = (start, end)
+        return out
+
+    def _load_one(self, rel_path, trim=None):
         # 兼容带子目录的路径，如 "subfolder/xxx.wav"
         rel = rel_path.replace("\\", "/").lstrip("/")
         path = os.path.abspath(os.path.join(self.output_dir, rel))
@@ -167,15 +209,25 @@ class TaiYangMultiAudioLoader:
             raise FileNotFoundError(path)
         # 与 ComfyUI LoadAudio 一致：waveform [C,T] -> unsqueeze -> [1,C,T]
         waveform, sample_rate = torchaudio.load(path)
+
+        # 按前端两条竖线设定的区间裁剪（单位：秒）
+        if trim:
+            start, end = trim
+            total = waveform.shape[-1]
+            i0 = max(0, min(total - 1, int(round(start * sample_rate))))
+            i1 = total if end is None else max(i0 + 1, min(total, int(round(end * sample_rate))))
+            waveform = waveform[..., i0:i1]
+
         return {"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate}
 
-    def load_audios(self, audio_files, auto_link="自动"):
+    def load_audios(self, audio_files, trims="[]", auto_link="自动"):
         files = self._parse_files(audio_files)
+        trim_map = self._parse_trims(trims)
         results = []
         for i in range(MAX_AUDIOS):
             if i < len(files):
                 try:
-                    results.append(self._load_one(files[i]))
+                    results.append(self._load_one(files[i], trim_map.get(files[i])))
                 except Exception as e:
                     print(f"[TaiYangMultiAudioLoader] 读取失败 {files[i]}: {e}")
                     results.append(None)
