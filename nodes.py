@@ -4,9 +4,11 @@ import os
 import folder_paths
 import numpy as np
 import torch
+import torchaudio
 from PIL import Image
 
 MAX_IMAGES = 16
+MAX_AUDIOS = 8
 
 
 class TaiYangMultiImageLoader:
@@ -75,10 +77,80 @@ class TaiYangMultiImageLoader:
         return tuple(results)
 
 
+class TaiYangMultiAudioLoader:
+    """多音频参考输入节点：多路 AUDIO 输出，按顺序喂给各多音频接入节点。
+
+    前端会自动把本节点的输出连到目标节点的：
+      - MiniMaxH3ReferenceToVideo 的 ref_audios.ref_audio_N（autogrow 动态槽）
+      - MiniMaxH3MaterialPromptStar7 的 ref_audio_N（schema 固定槽）
+    空槽位返回 None，避免把无效音频送进模型。
+    """
+
+    def __init__(self):
+        self.output_dir = folder_paths.get_input_directory()
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "audio_files": ("STRING", {"default": "[]", "multiline": False}),
+                "auto_link": (["自动", "MiniMaxH3ReferenceToVideo", "MiniMaxH3MaterialPromptStar7", "关闭"], {"default": "自动"}),
+            },
+        }
+
+    RETURN_TYPES = tuple(["AUDIO"] * MAX_AUDIOS)
+    RETURN_NAMES = tuple([f"audio_{i + 1}" for i in range(MAX_AUDIOS)])
+    RETURN_TYPES_AND_NAMES = tuple(zip(RETURN_TYPES, RETURN_NAMES))
+    FUNCTION = "load_audios"
+    CATEGORY = "TaiYang"
+
+    def _parse_files(self, audio_files):
+        if isinstance(audio_files, (list, tuple)):
+            raw = list(audio_files)
+        else:
+            try:
+                raw = json.loads(audio_files or "[]")
+            except Exception:
+                raw = []
+            if not isinstance(raw, list):
+                raw = []
+        return [f for f in raw if isinstance(f, str) and f.strip()][:MAX_AUDIOS]
+
+    def _load_one(self, rel_path):
+        # 兼容带子目录的路径，如 "subfolder/xxx.wav"
+        rel = rel_path.replace("\\", "/").lstrip("/")
+        path = os.path.abspath(os.path.join(self.output_dir, rel))
+        root = os.path.abspath(self.output_dir)
+        if os.path.commonpath([root, path]) != root:
+            raise ValueError(f"非法路径: {rel_path}")
+        if not os.path.isfile(path):
+            raise FileNotFoundError(path)
+        # 与 ComfyUI LoadAudio 一致：waveform [C,T] -> unsqueeze -> [1,C,T]
+        waveform, sample_rate = torchaudio.load(path)
+        return {"waveform": waveform.unsqueeze(0), "sample_rate": sample_rate}
+
+    def load_audios(self, audio_files, auto_link="自动"):
+        files = self._parse_files(audio_files)
+        results = []
+        for i in range(MAX_AUDIOS):
+            if i < len(files):
+                try:
+                    results.append(self._load_one(files[i]))
+                except Exception as e:
+                    print(f"[TaiYangMultiAudioLoader] 读取失败 {files[i]}: {e}")
+                    results.append(None)
+            else:
+                # 没音频的槽位返回 None：不参与执行，也不会污染下游参考音频
+                results.append(None)
+        return tuple(results)
+
+
 NODE_CLASS_MAPPINGS = {
-    "TaiYangMultiImageLoader": TaiYangMultiImageLoader
+    "TaiYangMultiImageLoader": TaiYangMultiImageLoader,
+    "TaiYangMultiAudioLoader": TaiYangMultiAudioLoader
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "TaiYangMultiImageLoader": "Multi Image Loader"
+    "TaiYangMultiImageLoader": "Multi Image Loader",
+    "TaiYangMultiAudioLoader": "Multi Audio Loader"
 }

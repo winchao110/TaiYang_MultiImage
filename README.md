@@ -30,6 +30,23 @@
 - 松手后顺序落盘，下游连线**自动跟随**（`image_N` 接的是新顺序下第 N 位的图）
 - 拖动中可随时改变目标位置，动画连贯衔接
 
+### 多音频加载（Multi Audio Loader）
+同包内第二个节点，功能与多图节点一致，只是把图片换成音频：
+
+- 单节点最多 **8 个音频**，网格布局，格子内显示音符图标 + 文件名
+- **拖拽排序**：按住拖动实时让位，松手后顺序落盘、连线自动跟随
+- **自动连线**：连到各多音频参考节点（见下表），空音频槽返回 `None`
+
+**音频自动连线目标：**
+
+| 目标节点 | 槽位类型 | 示例 |
+|---|---|---|
+| `MiniMaxH3ReferenceToVideo` | TemplatePrefix（0 基，autogrow 动态槽） | `ref_audios.ref_audio_0` |
+| `MiniMaxH3MaterialPromptStar7` | 固定槽位 | `ref_audio_0` / `ref_audio_1` / `ref_audio_2` |
+
+- 音频经 ComfyUI 的 `/upload/image` 端点上传（唯一通用上传端点），落到 `input/` 目录
+- 后端用 `torchaudio` 加载，输出 `{"waveform": ..., "sample_rate": ...}`，与内置 LoadAudio 节点一致
+
 ## 安装
 
 ```bash
@@ -37,14 +54,24 @@ cd ComfyUI/custom_nodes
 git clone https://github.com/winchao110/TaiYang_MultiImage.git
 ```
 
-重启 ComfyUI 即可。节点位于分类 `TaiYang` 下，名为 **Multi Image Loader**。
+重启 ComfyUI 即可。分类 `TaiYang` 下有两个节点：
+
+- **Multi Image Loader** —— 多图参考
+- **Multi Audio Loader** —— 多音频参考
 
 ## 使用
 
+### 多图
 1. 添加节点 `Multi Image Loader`
 2. 点击网格中的 `+` 上传图片（可多选）
 3. 在画布上放置一个支持多图参考的节点（如 `TextEncodeQwenImage21`）
 4. 图片会自动连过去；若没有，用右键菜单的「重新自动连线」
+
+### 多音频
+1. 添加节点 `Multi Audio Loader`
+2. 点击 `+` 上传音频（可多选）
+3. 放置 `MiniMaxH3ReferenceToVideo` 或 `MiniMaxH3MaterialPromptStar7`
+4. 音频会自动连到 `ref_audio` 槽；拖动可改顺序，连线自动跟随
 
 底部状态条显示当前 `auto_link` 模式，点击可在「自动 / 关闭」间切换。
 右键菜单可指定具体目标节点类型。
