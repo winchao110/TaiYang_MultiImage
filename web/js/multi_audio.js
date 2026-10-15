@@ -427,15 +427,58 @@ function pickRulerStep(dur, width) {
   return candidates[candidates.length - 1];
 }
 
-/** 正在试听的 {name, start, end, el} */
+/** 正在试听的 {name, index, start, end, el, timer} */
 let previewing = null;
+
+/**
+ * 精确 seek 到指定秒数，完成后回调 done()。
+ *
+ * 为什么不能 `el.currentTime = x` 之后立刻 play()：
+ * mp3 / aac 这类压缩格式必须从**上一个关键帧**开始解码，浏览器需要一点时间
+ * 才能定位到目标点。不等 seek 完成就play()，实际出声位置会明显偏前，
+ * 表现为「试听没有从起始竖线开始」。
+ *
+ * 这里等 'seeked' 事件，并在误差 >60ms 时再校正一次
+ * （部分浏览器 seek 完成后仍会差几十毫秒）。
+ */
+function preciseSeek(el, time, done) {
+  let finished = false;
+  let retried = 0;
+  const finish = () => {
+    if (finished) return;
+    finished = true;
+    done();
+  };
+  const onSeeked = () => {
+    const err = Math.abs((el.currentTime || 0) - time);
+    if (err > 0.06 && retried < 1) {
+      retried++;
+      try {
+        el.currentTime = time;
+      } catch {
+        return finish();
+      }
+      el.addEventListener("seeked", finish, { once: true });
+      return;
+    }
+    finish();
+  };
+  try {
+    el.currentTime = time;
+  } catch {
+    return finish();
+  }
+  el.addEventListener("seeked", onSeeked, { once: true });
+  // 兜底：个别格式不触发 seeked，300ms 后强行继续，别卡住
+  setTimeout(finish, 300);
+}
 
 /**
  * 试听：从 start 播到 end。
  * 已在试听同一条-> 停止；试听别的 -> 先停旧的再播新的。
  *
- * 关键：**必须等 metadata 加载完再设 currentTime 并 play()**。
- * 在 metadata 之前设 currentTime 会被浏览器直接忽略，表现为「从头开始播」。
+ * 流程：**loadedmetadata -> preciseSeek(起点) -> play()**，
+ * 三步都完成才真正出声，保证起点精确落在起始竖线上。
  * @returns {boolean} 是否成功开始试听
  */
 function togglePreview(node, index, name) {
@@ -451,14 +494,9 @@ function togglePreview(node, index, name) {
   const entry = { name, index, start: t.s, end: t.e, el, timer: null };
   previewing = entry;
 
-  // metadata 就绪后才真正开始播放（否则 currentTime 设置无效）
-  const kick = () => {
+  // 真正开始播放：轮询 + play + 更新标记
+  const begin = () => {
     if (previewing !== entry) return;
-    try {
-      el.currentTime = Math.max(0, t.s);
-    } catch {
-      /* 忽略：有些格式可能不支持直接 seek */
-    }
     // 轮询播放头：越过终点就停，并驱动播放头重绘
     entry.timer = setInterval(() => {
       if (!previewing || previewing !== entry) return;
@@ -476,6 +514,12 @@ function togglePreview(node, index, name) {
     node._playing = name;
     node._playingIndex = index;
     node.setDirtyCanvas?.(true, true);
+  };
+
+  // metadata 就绪 -> 精确 seek 到起点 -> 才开始播
+  const kick = () => {
+    if (previewing !== entry) return;
+    preciseSeek(el, Math.max(0, t.s), begin);
   };
 
   if (el.readyState >= 1) {
@@ -1611,7 +1655,15 @@ app.registerExtension({
           // 终点必须严格在起点右侧
           setTrim(this, index, tr.s, Math.max(secs, tr.s + 0.01), dur);
         }
-        // 拖动时把播放头反馈出来
+        // 正在试听这条时：拖起点竖线要把播放位置也带过去，
+        // 否则竖线和实际听到的位置会对不上（看着不准）。
+        if (previewing && previewing.index === index && which === "s") {
+          try {
+            previewing.el.currentTime = Math.max(0, secs);
+          } catch {
+            /* 忽略：seek 失败不影响区间调整 */
+          }
+        }
         this.setDirtyCanvas(true, true);
         return true;
       }
