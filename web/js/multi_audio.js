@@ -221,9 +221,13 @@ function setAudios(node, files) {
   if (node.size && node.size[0] < MIN_NODE_W) node.size[0] = MIN_NODE_W;
   // 音频列表变了：按新顺序重新对齐裁剪区间（同名音频也各自独立）
   pruneTrims(node);
-  // **预取新增音频的时长**：新上传的音频必须有时长才会画裁剪竖线与时间刻度。
+  // **预取音频数据**：新上传的音频必须有时长才会画裁剪竖线与时间刻度。
+  // 同时解码 buffer（供精确试听 + 画真实波形）。
   // （以前只在 onNodeCreated/onConfigure 里取，上传的音频一直没取到 → 不显示竖线）
-  (list || []).forEach((n) => getDuration(node, n));
+  (list || []).forEach((n) => {
+    getDuration(node, n);
+    getAudioBuffer(node, n);
+  });
   node.setDirtyCanvas(true, true);
 }
 
@@ -403,6 +407,80 @@ function audioUrl(name) {
   return `/api/view?filename=${encodeURIComponent(name)}&type=input`;
 }
 
+// ---------------------------------------------------------------- Web Audio 解码（精确试听）
+//
+// 为什么要解码而不是直接 seek HTMLAudioElement：
+// 浏览器对**没有 Xing/Info 头的 CBR MP3**只能按码率估算位置，seek 误差
+// 可达数秒（表现为「试听比竖线早了 1.5 秒」这类整段偏移）。
+// 用 Web Audio 解码成 AudioBuffer 后，可以按**采样点**指定起播/时长，
+// 完全不受 seek 估算影响。附带好处：能拿到真实波形数据。
+
+/** 全局 AudioContext（懒创建，必须在用户手势里 resume） */
+let _audioCtx = null;
+function ensureAudioCtx() {
+  if (!_audioCtx) {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    if (!AC) return null;
+    _audioCtx = new AC();
+  }
+  if (_audioCtx.state === "suspended") _audioCtx.resume().catch(() => {});
+  return _audioCtx;
+}
+
+/**
+ * 取解码后的 AudioBuffer（带缓存）。
+ * @returns {Promise<{buffer:AudioBuffer,duration:number}|null>} 失败返回 null
+ */
+function getAudioBuffer(node, name) {
+  const cache = (node._bufs ||= {});
+  if (cache[name] != null) return Promise.resolve(cache[name]);
+  const ctx = ensureAudioCtx();
+  if (!ctx) return Promise.resolve(null);
+  return fetch(audioUrl(name))
+    .then((r) => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.arrayBuffer();
+    })
+    .then((ab) => ctx.decodeAudioData(ab))
+    .then((buf) => {
+      cache[name] = { buffer: buf, duration: buf.duration };
+      // 用解码后的**精确时长**回填（HTMLAudioElement 的 metadata 对 MP3 只是估算）
+      if (node._durations) node._durations[name] = buf.duration;
+      node.setDirtyCanvas?.(true, true);
+      return cache[name];
+    })
+    .catch(() => {
+      cache[name] = null;   // 记失败，避免反复重试
+      return null;
+    });
+}
+
+/**
+ * 从 AudioBuffer 提取波形峰值（用于绘制），按 outW 列聚合。
+ * 返回 Float32Array(outW)，值域 0~1。
+ */
+function waveformPeaks(buf, outW) {
+  const n = Math.max(1, Math.floor(outW));
+  const out = new Float32Array(n);
+  const data = buf.getChannelData(0);
+  const step = data.length / n;
+  for (let i = 0; i < n; i++) {
+    const s = Math.floor(i * step);
+    const e = Math.min(data.length, Math.floor((i + 1) * step));
+    let peak = 0;
+    for (let j = s; j < e; j++) {
+      const v = Math.abs(data[j]);
+      if (v > peak) peak = v;
+    }
+    out[i] = peak;
+  }
+  // 归一化到 0~1（静音片段不会把整体压得太小）
+  let max = 0;
+  for (let i = 0; i < n; i++) if (out[i] > max) max = out[i];
+  if (max > 0) for (let i = 0; i < n; i++) out[i] /= max;
+  return out;
+}
+
 /**
  * 选时间刻度的间隔（秒）。
  * 目标：相邻刻度至少相距 34px，且刻度总数不超过 8 个——
@@ -430,55 +508,18 @@ function pickRulerStep(dur, width) {
 /** 正在试听的 {name, index, start, end, el, timer} */
 let previewing = null;
 
-/**
- * 精确 seek 到指定秒数，完成后回调 done()。
- *
- * 为什么不能 `el.currentTime = x` 之后立刻 play()：
- * mp3 / aac 这类压缩格式必须从**上一个关键帧**开始解码，浏览器需要一点时间
- * 才能定位到目标点。不等 seek 完成就play()，实际出声位置会明显偏前，
- * 表现为「试听没有从起始竖线开始」。
- *
- * 这里等 'seeked' 事件，并在误差 >60ms 时再校正一次
- * （部分浏览器 seek 完成后仍会差几十毫秒）。
- */
-function preciseSeek(el, time, done) {
-  let finished = false;
-  let retried = 0;
-  const finish = () => {
-    if (finished) return;
-    finished = true;
-    done();
-  };
-  const onSeeked = () => {
-    const err = Math.abs((el.currentTime || 0) - time);
-    if (err > 0.06 && retried < 1) {
-      retried++;
-      try {
-        el.currentTime = time;
-      } catch {
-        return finish();
-      }
-      el.addEventListener("seeked", finish, { once: true });
-      return;
-    }
-    finish();
-  };
-  try {
-    el.currentTime = time;
-  } catch {
-    return finish();
-  }
-  el.addEventListener("seeked", onSeeked, { once: true });
-  // 兜底：个别格式不触发 seeked，300ms 后强行继续，别卡住
-  setTimeout(finish, 300);
-}
 
 /**
  * 试听：从 start 播到 end。
  * 已在试听同一条-> 停止；试听别的 -> 先停旧的再播新的。
  *
- * 流程：**loadedmetadata -> preciseSeek(起点) -> play()**，
- * 三步都完成才真正出声，保证起点精确落在起始竖线上。
+ * **用 Web Audio 而不是 HTMLAudioElement.seek**：
+ * 浏览器对无 Xing 头的 CBR MP3 只能按码率估算位置，seek 可能差好几秒
+ * （表现为「比竖线早了 1.5 秒」这种整段偏移）。
+ * 解码成 AudioBuffer 后用 `source.start(0, offset, duration)` 可以
+ * **按采样点**指定起播与时长，起点/终点都精确落在竖线上。
+ *
+ * 流程：取/解码 buffer -> start(offset=起点, duration=终点-起点) -> 轮询播放头。
  * @returns {boolean} 是否成功开始试听
  */
 function togglePreview(node, index, name) {
@@ -489,50 +530,82 @@ function togglePreview(node, index, name) {
   }
   stopPreview();
 
-  const el = new Audio();
-  el.preload = "auto";
-  const entry = { name, index, start: t.s, end: t.e, el, timer: null };
+  const dur = (node._durations || {})[name] || t.e || 0;
+  const startSec = Math.max(0, t.s);
+  const endSec = t.e != null ? t.e : dur;
+  if (!(endSec > startSec)) return false;   // 区间非法，不播
+
+  const ctx = ensureAudioCtx();
+  const entry = {
+    name, index, start: startSec, end: endSec,
+    src: null, buffer: null, timer: null, mode: null, t0: 0,
+  };
   previewing = entry;
 
-  // 真正开始播放：轮询 + play + 更新标记
-  const begin = () => {
-    if (previewing !== entry) return;
-    // 轮询播放头：越过终点就停，并驱动播放头重绘
-    entry.timer = setInterval(() => {
-      if (!previewing || previewing !== entry) return;
-      const cur = el.currentTime || 0;
-      if (entry.end != null && cur >= entry.end - 0.02) {
-        stopPreview();
-        return;
-      }
-      node.setDirtyCanvas?.(true, true);
-    }, 60);
-    const p = el.play();
-    if (p && typeof p.catch === "function") {
-      p.catch(() => stopPreview());
+  getAudioBuffer(node, name).then((info) => {
+    if (previewing !== entry || !info) return;      // 已被停止 / 解码失败
+    const { buffer } = info;
+    entry.buffer = buffer;
+    // 用解码后的真实时长兜底：metadata 估算可能不准
+    if (entry.end == null || entry.end > buffer.duration) {
+      entry.end = buffer.duration;
     }
+    const src = ctx.createBufferSource();
+    src.buffer = buffer;
+    src.connect(ctx.destination);
+    entry.src = src;
+    entry.mode = "webaudio";
+    // 采样级精确：从 startSec 起，播 (endSec-startSec) 秒
+    const playDur = Math.max(0.001, endSec - startSec);
+    entry.t0 = ctx.currentTime;
+    src.start(0, Math.min(startSec, buffer.duration), playDur);
+    src.onended = () => {
+      if (previewing === entry) stopPreview();
+    };
     node._playing = name;
     node._playingIndex = index;
     node.setDirtyCanvas?.(true, true);
-  };
+  });
 
-  // metadata 就绪 -> 精确 seek 到起点 -> 才开始播
-  const kick = () => {
-    if (previewing !== entry) return;
-    preciseSeek(el, Math.max(0, t.s), begin);
-  };
-
-  if (el.readyState >= 1) {
-    kick();
-  } else {
-    el.addEventListener("loadedmetadata", kick, { once: true });
-  }
-  el.onended = () => {
-    if (previewing === entry) stopPreview();
-  };
-  el.onerror = () => stopPreview();
-  el.src = audioUrl(name);
   return true;
+}
+
+/** 当前试听的播放头（秒，绝对时间）；未播放返回 null */
+function previewPosition() {
+  if (!previewing || previewing.mode !== "webaudio" || !_audioCtx) return null;
+  const el = _audioCtx.currentTime - previewing.t0 + previewing.start;
+  return Math.min(el, previewing.end ?? el);
+}
+
+/**
+ * 拖动竖线时把播放头挪到新位置（不打断播放）。
+ * Web Audio 没有「seek」概念，只能停掉当前 source 再按新 offset 起一个，
+ * 听感上仍是连续的。
+ */
+function seekPreview(newStart) {
+  if (!previewing || previewing.mode !== "webaudio" || !_audioCtx) return;
+  const e = previewing;
+  const ctx = _audioCtx;
+  try {
+    e.src?.stop?.();
+    e.src?.disconnect?.();
+  } catch {
+    /* 忽略 */
+  }
+  e.start = newStart;
+  const buf = e.buffer;
+  if (!buf) return;
+  const endSec = e.end ?? buf.duration;
+  if (!(endSec > newStart)) return;
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.connect(ctx.destination);
+  e.src = src;
+  e.t0 = ctx.currentTime;
+  src.start(0, Math.min(newStart, buf.duration), Math.max(0.001, endSec - newStart));
+  src.onended = () => {
+    if (previewing === e) stopPreview();
+  };
 }
 
 /** 停止试听 */
@@ -545,9 +618,8 @@ function stopPreview() {
     e.timer = null;
   }
   try {
-    e.el.pause();
-    e.el.currentTime = 0;
-    e.el.src = "";
+    e.src?.stop?.();
+    e.src?.disconnect?.();
   } catch {
     /* 忽略：停止失败无所谓 */
   }
@@ -1316,6 +1388,24 @@ app.registerExtension({
         ctx.roundRect(waveX, waveTop, waveW, waveH, 3);
         ctx.fill();
 
+        // 真实波形（解码成功后才有）：先画，竖线和高亮盖在上面
+        const bufInfo = (this._bufs || {})[name];
+        if (bufInfo?.buffer) {
+          const peaks = waveformPeaks(bufInfo.buffer, Math.round(waveW));
+          const mid = waveTop + waveH / 2;
+          const half = waveH / 2 - 1;
+          ctx.strokeStyle = "rgba(150,200,240,0.85)";
+          ctx.lineWidth = 1;
+          ctx.beginPath();
+          for (let i = 0; i < peaks.length; i++) {
+            const px = waveX + (i / Math.max(1, peaks.length - 1)) * waveW;
+            const h = Math.max(0.5, peaks[i] * half);
+            ctx.moveTo(px, mid - h);
+            ctx.lineTo(px, mid + h);
+          }
+          ctx.stroke();
+        }
+
         if (dur > 0) {
           // 有时长才能定位竖线
           const sx = waveX + (tr.s / dur) * waveW;
@@ -1363,13 +1453,16 @@ app.registerExtension({
           ctx.closePath();
           ctx.fill();
 
-          // 试听播放头
+          // 试听播放头（用 Web Audio 的时钟，比 el.currentTime 精确得多）
           if (playing && previewing) {
-            const t = Math.min(previewing.el.currentTime || 0, previewing.end ?? dur);
-            const px = waveX + ((t - tr.s) / Math.max(0.001, (tr.e ?? dur) - tr.s)) * (ex - sx);
-            if (px >= sx && px <= ex) {
-              ctx.fillStyle = "#ffd479";
-              ctx.fillRect(px - 1, waveTop, 2, waveH);
+            const t = previewPosition();
+            if (t != null) {
+              const span = Math.max(0.001, (tr.e ?? dur) - tr.s);
+              const px = waveX + ((t - tr.s) / span) * (ex - sx);
+              if (px >= sx && px <= ex) {
+                ctx.fillStyle = "#ffd479";
+                ctx.fillRect(px - 1, waveTop, 2, waveH);
+              }
             }
           }
         } else {
@@ -1658,11 +1751,7 @@ app.registerExtension({
         // 正在试听这条时：拖起点竖线要把播放位置也带过去，
         // 否则竖线和实际听到的位置会对不上（看着不准）。
         if (previewing && previewing.index === index && which === "s") {
-          try {
-            previewing.el.currentTime = Math.max(0, secs);
-          } catch {
-            /* 忽略：seek 失败不影响区间调整 */
-          }
+          seekPreview(Math.max(0, secs));
         }
         this.setDirtyCanvas(true, true);
         return true;
