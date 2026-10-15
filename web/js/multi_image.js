@@ -1156,14 +1156,13 @@ app.registerExtension({
 
       // ---------------------------------------------------------- 底部缩放条
       // 等价内置 ImageScaleToTotalPixels：按总像素数缩放。
-      // 自绘条显示当前档位，左键点击在预设间循环；精确设置走右键菜单。
+      // 左区=目标百万像素，右区=分辨率整数倍，两区都可点击填任意数字。
       const sbw = NODE_W - 24;
       const sbx = 12;
       const sby = HEADER_H + GRID_H + BAR_GAP;
       const mp = getMegapixels(this);
-      const method = getUpscaleMethod(this);
       const steps = getResolutionSteps(this);
-      // 缩放条分左右两区：左区=百万像素（可填任意数字），右区=分辨率倍数
+      // 左区要放得下「缩放图像：0(百万像素，填0不缩放)」，所以左区给 62% 宽
       const splitX = sbx + sbw * 0.62;
       this._scaleBar = { x: sbx, y: sby, w: sbw, h: SCALE_BAR_H };
       this._scaleMpZone = { x: sbx, y: sby, w: splitX - sbx, h: SCALE_BAR_H };
@@ -1178,7 +1177,7 @@ app.registerExtension({
       ctx.roundRect(sbx, sby, sbw, SCALE_BAR_H, 5);
       ctx.fill();
 
-      // 左区：百万像素
+      // 左区：缩放图像：<MP>(百万像素，填0不缩放)
       ctx.fillStyle = hoverMp ? "#3d4a58" : "#2a2f36";
       ctx.beginPath();
       ctx.roundRect(sbx, sby, splitX - sbx - 1, SCALE_BAR_H, 5);
@@ -1187,16 +1186,34 @@ app.registerExtension({
       ctx.lineWidth = 1;
       ctx.stroke();
 
-      const mpText = mp > 0 ? `${trimNum(mp)} MP` : "关闭缩放";
-      ctx.fillStyle = hoverMp ? "#eaf6ff" : mp > 0 ? "#8fe08f" : "#c8d2dc";
-      ctx.font = "12px Arial";
-      ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.fillText(mpText, (sbx + splitX) / 2, sby + SCALE_BAR_H / 2 + 1);
-      // 铅笔图标，提示可编辑
+      ctx.textAlign = "left";
+      const barMidY = sby + SCALE_BAR_H / 2 + 1;
+      // 铅笔图标（提示可点击编辑）
       ctx.fillStyle = hoverMp ? "#8fd0ff" : "#7d8894";
       ctx.font = "11px Arial";
-      ctx.fillText("✎", sbx + 12, sby + SCALE_BAR_H / 2 + 1);
+      const iconW = ctx.measureText("✎").width;
+      ctx.fillText("✎", sbx + 8, barMidY);
+
+      // 「缩放图像：」固定前缀
+      const prefix = "缩放图像：";
+      ctx.fillStyle = hoverMp ? "#eaf6ff" : "#c8d2dc";
+      ctx.font = "12px Arial";
+      const prefixW = ctx.measureText(prefix).width;
+      const px = sbx + 8 + iconW + 4;
+      ctx.fillText(prefix, px, barMidY);
+
+      // 数值（缩放生效时高亮绿色）
+      ctx.fillStyle = hoverMp ? "#eaf6ff" : mp > 0 ? "#8fe08f" : "#8a939c";
+      ctx.font = "bold 12px Arial";
+      const valText = trimNum(mp);
+      const valW = ctx.measureText(valText).width;
+      ctx.fillText(valText, px + prefixW, barMidY);
+
+      // 固定说明后缀
+      ctx.fillStyle = hoverMp ? "#c8d2dc" : "#7d8894";
+      ctx.font = "11px Arial";
+      ctx.fillText("(百万像素，填0不缩放)", px + prefixW + valW + 1, barMidY);
 
       // 分隔线
       ctx.strokeStyle = "#4a5560";
@@ -1205,7 +1222,7 @@ app.registerExtension({
       ctx.lineTo(splitX, sby + SCALE_BAR_H - 4);
       ctx.stroke();
 
-      // 右区：分辨率倍数
+      // 右区：分辨率整数倍：N（默认 32，N 表示宽高对齐 N 的整数倍）
       ctx.fillStyle = hoverSteps ? "#3d4a58" : "#2a2f36";
       ctx.beginPath();
       ctx.roundRect(splitX + 1, sby, sbx + sbw - splitX - 1, SCALE_BAR_H, 5);
@@ -1214,10 +1231,16 @@ app.registerExtension({
       ctx.lineWidth = 1;
       ctx.stroke();
 
+      ctx.textAlign = "left";
+      const sx = splitX + 8;
       ctx.fillStyle = hoverSteps ? "#eaf6ff" : "#c8d2dc";
       ctx.font = "11px Arial";
-      ctx.textAlign = "center";
-      ctx.fillText(`×${steps}`, (splitX + sbx + sbw) / 2, sby + SCALE_BAR_H / 2 + 1);
+      const sPrefix = "分辨率整数倍：";
+      const sPrefixW = ctx.measureText(sPrefix).width;
+      ctx.fillText(sPrefix, sx, barMidY);
+      ctx.fillStyle = hoverSteps ? "#eaf6ff" : "#8fd0ff";
+      ctx.font = "bold 11px Arial";
+      ctx.fillText(String(steps), sx + sPrefixW, barMidY);
       ctx.textBaseline = "alphabetic";
 
       // ---------------------------------------------------------- 底部模式条
