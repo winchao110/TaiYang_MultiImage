@@ -84,6 +84,15 @@ function getWidget(node, name) {
   return node?.widgets?.find((w) => w.name === name) || null;
 }
 
+/**
+ * 节点是否被折叠。LiteGraph 折叠后只画一条标题栏，
+ * 但仍然会调用 onDrawForeground，所以自绘部分必须自己判断并整体跳过，
+ * 否则网格和底部控制条会画到节点框外的画布上。
+ */
+function isCollapsed(node) {
+  return node?.flags?.collapsed === true || node?.collapsed === true;
+}
+
 function getMode(node) {
   const w = getWidget(node, "auto_link");
   if (!w) return MODE_AUTO;
@@ -720,6 +729,10 @@ app.registerExtension({
     nodeType.prototype.onDrawForeground = function (ctx) {
       origDraw?.apply(this, arguments);
 
+      // 折叠时必须整体跳过自绘：LiteGraph 折叠后仍会调用 onDrawForeground，
+      // 若继续画，网格与底部条会跑到节点框外的画布上（节点只剩一条标题栏）。
+      if (isCollapsed(this)) return;
+
       const audios = this._audios || [];
       const { cell, gap, cols, startX, startY } = GRID;
       this._gridPos = { ...GRID };
@@ -963,6 +976,9 @@ app.registerExtension({
 
     const origMove = nodeType.prototype.onMouseMove;
     nodeType.prototype.onMouseMove = function (e, pos) {
+      // 折叠时不更新 hover / 拖拽，自绘区域已不再显示
+      if (isCollapsed(this)) return origMove?.apply(this, arguments);
+
       // 1) 已按下未越阈值：等越过 DRAG_THRESHOLD 才升级为拖拽（单击无动作）
       if (this._press && !this._drag) {
         const dx = pos[0] - this._press.x;
@@ -1029,6 +1045,9 @@ app.registerExtension({
 
     const origDown = nodeType.prototype.onMouseDown;
     nodeType.prototype.onMouseDown = function (e, pos) {
+      // 折叠时节点只剩标题栏，自绘区域全部不可交互，直接交回 LiteGraph
+      if (isCollapsed(this)) return origDown?.apply(this, arguments);
+
       // 底部模式条：左键在「自动 / 关闭」间切换；有手动目标时先清掉手动目标
       if (barAt(this, pos)) {
         if (this._audioManualTarget) {
