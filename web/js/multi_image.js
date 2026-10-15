@@ -46,6 +46,13 @@ const RIGHT_PAD = SLOT_DOT_W + SLOT_LABEL_W;
 // 否则视为普通单击，从而做到单击无动作、只有按住拖动才生效。
 const DRAG_THRESHOLD = 8;
 
+// ---------------------------------------------------------------- 缩放（等价内置 ImageScaleToTotalPixels）
+// 与内置节点一致：按「总像素数 = megapixels × 1024²」等比缩放，宽高对齐到
+// resolution_steps 的整数倍。0 表示不缩放，保持原分辨率。
+// 常用预设，交互条在预设间循环切换，右键菜单可精确设置。
+const SCALE_PRESETS = [0, 0.5, 1, 1.5, 2, 4];
+const UPSCALE_METHODS = ["nearest-exact", "bilinear", "area", "bicubic", "lanczos"];
+
 // ---------------------------------------------------------------- 拖拽排序（纯逻辑）
 // 统一模型：用「顺序数组」描述状态。
 //   order[p] = 位置 p 上放的是原来第几张图
@@ -82,8 +89,14 @@ function reorderList(list, from, to) {
 // auto_link 控件所在行的顶部与节点底部留白
 const WIDGET_TOP_GAP = HEADER_H + GRID_H;
 const WIDGET_H = 34;
+// 缩放条（等价内置 ImageScaleToTotalPixels）。同样是自绘，理由同 auto_link：
+// 隐藏 widget 会生成 DOM 覆盖层挡住网格，所以外观自绘、点击自己处理。
+const SCALE_BAR_H = 26;
+const BAR_H = 24;
+const BAR_GAP = 6;
 const NODE_W = START_X * 2 + COLS * CELL + (COLS - 1) * GAP + RIGHT_PAD;
-const NODE_H = WIDGET_TOP_GAP + WIDGET_H + 10;
+// 节点高度 = 标题 + 网格 + 缩放条 + auto_link 条
+const NODE_H = WIDGET_TOP_GAP + SCALE_BAR_H + BAR_H + BAR_GAP * 2 + 10;
 
 // ---------------------------------------------------------------- 基础工具
 
@@ -113,6 +126,44 @@ function getImageFiles(node) {
   } catch {
     return [];
   }
+}
+
+/** 缩放参数读写：widget 都是 hidden 的（hidden widget 仍保留在数组里，后端按名取值） */
+function getMegapixels(node) {
+  const w = getWidget(node, "megapixels");
+  const v = Number(w?.value);
+  return Number.isFinite(v) && v > 0 ? v : 0;
+}
+
+function setMegapixels(node, mp) {
+  const w = getWidget(node, "megapixels");
+  if (w) w.value = Math.max(0, Number(mp) || 0);
+  node.setDirtyCanvas?.(true, true);
+}
+
+function getUpscaleMethod(node) {
+  const w = getWidget(node, "upscale_method");
+  return w?.value || "bilinear";
+}
+
+function setUpscaleMethod(node, m) {
+  const w = getWidget(node, "upscale_method");
+  if (w) w.value = m;
+  node.setDirtyCanvas?.(true, true);
+}
+
+/**
+ * 推算缩放后的实际尺寸（与后端 _scale_to_total_pixels 同一套公式）。
+ * megapixels<=0 时返回原尺寸。这样格子里显示的分辨率 = 真正送进模型的分辨率。
+ */
+function scaledSize(natW, natH, megapixels, resolutionSteps = 1) {
+  if (!natW || !natH || megapixels <= 0) return [natW, natH];
+  const total = megapixels * 1024 * 1024;
+  const scaleBy = Math.sqrt(total / (natW * natH));
+  const steps = Math.max(1, Math.round(resolutionSteps) || 1);
+  const w = Math.max(steps, Math.round((natW * scaleBy) / steps) * steps);
+  const h = Math.max(steps, Math.round((natH * scaleBy) / steps) * steps);
+  return [w, h];
 }
 
 function makeThumb(name) {
@@ -623,6 +674,7 @@ app.registerExtension({
       this._qwenImgCache = {};
       this._gridPos = null;
       this._hoverCell = -1;
+      this._hoverScaleBar = false;
       // 拖拽状态（统一模型，见「拖拽排序（纯逻辑）」）：
       //   _press      已按下待判定 { from, x, y }
       //   _drag       已确认拖拽 { from, to }
@@ -657,22 +709,22 @@ app.registerExtension({
       //  3) image_files 不 hidden + 高高度  -> 又变成 612px DOM 盖住网格 -> 还是没反应
       //
       // 所以凡是「高、且要盖在网格上」的占位一律不可行。
-      // 最终方案：两个 widget 都设 hidden（不产生 DOM、不占高度），
-      // auto_link 的外观由 onDrawForeground 自己画，点击由 onMouseDown 自己处理，
+      // 最终方案：所有 widget 都设 hidden（不产生 DOM、不占高度），
+      // auto_link 与缩放参数的外观由 onDrawForeground 自己画，点击由 onMouseDown 处理，
       // 完全绕开 widget 的 DOM 层与布局。
       // widget 仍留在 widgets 数组里，后端才能按名字拿到值。
-      const imgWidget = getWidget(this, "image_files");
-      if (imgWidget) {
-        imgWidget.dontHide = true;
-        imgWidget.hidden = true;
-        imgWidget.computeSize = () => [0, 0];
-        imgWidget.draw = () => {};
-      }
-      if (modeWidget) {
-        modeWidget.hidden = true;
-        modeWidget.computeSize = () => [0, 0];
-        modeWidget.draw = () => {};
-      }
+      const hideWidget = (w) => {
+        if (!w) return;
+        w.dontHide = true;
+        w.hidden = true;
+        w.computeSize = () => [0, 0];
+        w.draw = () => {};
+      };
+      hideWidget(getWidget(this, "image_files"));
+      hideWidget(getWidget(this, "upscale_method"));
+      hideWidget(getWidget(this, "megapixels"));
+      hideWidget(getWidget(this, "resolution_steps"));
+      hideWidget(modeWidget);
 
       return r;
     };
@@ -758,12 +810,38 @@ app.registerExtension({
         { content: "　↩ 回到自动发现", callback: () => backToAuto(node) },
       ];
 
+      // 缩放档位菜单行：选中即写入 megapixels widget（0 = 关闭缩放）
+      const mpRows = (presets, node) =>
+        presets.map((p) => ({
+          content: `${p === 0 ? "关闭缩放" : `${p} MP`}${getMegapixels(node) === p ? "  ✓当前" : ""}`,
+          callback: () => setMegapixels(node, p),
+        }));
+
       items.push({
         content: "🔗 重新自动连线",
         callback: () => {
           syncConnections(this);
           this.setDirtyCanvas(true, true);
         },
+      });
+
+      // ---- 缩放（等价内置 ImageScaleToTotalPixels）----
+      // 底部缩放条只能循环预设，这里可以精确指定数值与插值算法。
+      const curMp = getMegapixels(this);
+      const curMethod = getUpscaleMethod(this);
+      items.push({
+        content: `🔍 缩放设置（当前：${curMp > 0 ? `${curMp} MP` : "关闭"}）`,
+        callback: () => items.push(...mpRows(SCALE_PRESETS, this)),
+      });
+      items.push({
+        content: `⚙ 插值算法（当前：${curMethod}）`,
+        callback: () =>
+          items.push(
+            ...UPSCALE_METHODS.map((m) => ({
+              content: `　${m}${curMethod === m ? "  ✓当前" : ""}`,
+              callback: () => setUpscaleMethod(this, m),
+            }))
+          ),
       });
 
       // 多图节点子菜单：自动发现已覆盖这类，手动指定用于锁定/排除
@@ -917,6 +995,7 @@ app.registerExtension({
         ctx.setLineDash([]);
 
         const img = this._qwenImgCache[i];
+        const RES_BAR_H = 18; // 底部分辨率条高度
         if (img && img.complete && img.naturalWidth > 0) {
           // 固定区域内显示**完整**图片：用 Math.min 保证整张图都在框内（contain）
           const scale = Math.min(cell / img.naturalWidth, cell / img.naturalHeight);
@@ -926,8 +1005,47 @@ app.registerExtension({
           ctx.beginPath();
           ctx.roundRect(x, y, cell, cell, 6);
           ctx.clip();
-          ctx.drawImage(img, x + (cell - w) / 2, y + (cell - h) / 2, w, h);
+          // 给底部分辨率条让出空间：图片只在「格子 - 条高」的区域里 contain
+          const availH = cell - RES_BAR_H;
+          const scale2 = Math.min(cell / img.naturalWidth, availH / img.naturalHeight);
+          const w2 = img.naturalWidth * scale2;
+          const h2 = img.naturalHeight * scale2;
+          ctx.drawImage(img, x + (cell - w2) / 2, y + (availH - h2) / 2, w2, h2);
           ctx.restore();
+        }
+
+        // ---------------------------------------------------------------
+        // 分辨率条：显示**缩放后**的实际尺寸（真正送进模型的分辨率），
+        // 缩放关闭时就是原图尺寸。与内置 ImageScaleToTotalPixels 同一套公式。
+        // -----------------------------------------------------------------
+        const nat = img && img.complete && img.naturalWidth > 0 ? img : null;
+        if (nat) {
+          const mp = getMegapixels(this);
+          const [dw, dh] = scaledSize(nat.naturalWidth, nat.naturalHeight, mp, 1);
+          const by = y + cell - RES_BAR_H;
+          ctx.fillStyle = "rgba(12,16,20,0.82)";
+          ctx.beginPath();
+          // 下两角贴格、上面平齐，形成贴底的信息条
+          ctx.moveTo(x, by);
+          ctx.lineTo(x + cell, by);
+          ctx.lineTo(x + cell, y + cell - 6);
+          ctx.quadraticCurveTo(x + cell, y + cell, x + cell - 6, y + cell);
+          ctx.lineTo(x + 6, y + cell);
+          ctx.quadraticCurveTo(x, y + cell, x, y + cell - 6);
+          ctx.closePath();
+          ctx.fill();
+
+          const scaled = mp > 0;
+          ctx.fillStyle = scaled ? "#8fe08f" : "#c8d2dc";
+          ctx.font = "11px Arial";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          ctx.fillText(
+            scaled ? `${dw} × ${dh}` : `${nat.naturalWidth} × ${nat.naturalHeight}`,
+            x + cell / 2,
+            by + RES_BAR_H / 2
+          );
+          ctx.textBaseline = "alphabetic";
         }
         // 序号角标
         ctx.fillStyle = "rgba(0,0,0,0.7)";
@@ -980,13 +1098,51 @@ app.registerExtension({
         ctx.fillText("添加图片", ax + c, ay + c + 44);
       }
 
+      // ---------------------------------------------------------- 底部缩放条
+      // 等价内置 ImageScaleToTotalPixels：按总像素数缩放。
+      // 自绘条显示当前档位，左键点击在预设间循环；精确设置走右键菜单。
+      const sbw = NODE_W - 24;
+      const sbx = 12;
+      const sby = HEADER_H + GRID_H + BAR_GAP;
+      this._scaleBar = { x: sbx, y: sby, w: sbw, h: SCALE_BAR_H };
+      const mp = getMegapixels(this);
+      const method = getUpscaleMethod(this);
+
+      const scaleHover = this._hoverScaleBar === true;
+      ctx.fillStyle = scaleHover ? "#3d4a58" : "#2a2f36";
+      ctx.beginPath();
+      ctx.roundRect(sbx, sby, sbw, SCALE_BAR_H, 5);
+      ctx.fill();
+      ctx.strokeStyle = scaleHover ? "#8fd0ff" : "#4a5560";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      const scaleLabel =
+        mp > 0
+          ? `缩放：${mp} MP · ${method}`
+          : `缩放：关闭（保持原分辨率）· ${method}`;
+      ctx.fillStyle = scaleHover ? "#eaf6ff" : mp > 0 ? "#8fe08f" : "#c8d2dc";
+      ctx.font = "12px Arial";
+      ctx.textAlign = "center";
+      ctx.textBaseline = "middle";
+      ctx.fillText(scaleLabel, sbx + sbw / 2, sby + SCALE_BAR_H / 2 + 1);
+      // 右侧小三角，提示可点击切换
+      ctx.fillStyle = scaleHover ? "#8fd0ff" : "#7d8894";
+      ctx.beginPath();
+      ctx.moveTo(sbx + sbw - 20, sby + SCALE_BAR_H / 2 - 4);
+      ctx.lineTo(sbx + sbw - 10, sby + SCALE_BAR_H / 2 - 4);
+      ctx.lineTo(sbx + sbw - 15, sby + SCALE_BAR_H / 2 + 3);
+      ctx.closePath();
+      ctx.fill();
+      ctx.textBaseline = "alphabetic";
+
       // ---------------------------------------------------------- 底部模式条
       // auto_link 不再用 widget 渲染（widget 会生成 DOM 覆盖层挡住网格），
       // 改为自绘：点一下在「自动 / 关闭」之间切换，长按菜单里可细选。
       const bw = NODE_W - 24;
-      const bh = 24;
+      const bh = BAR_H;
       const bx = 12;
-      const by = HEADER_H + GRID_H + 8;
+      const by = sby + SCALE_BAR_H + BAR_GAP;
       this._modeBar = { x: bx, y: by, w: bw, h: bh };
 
       const hovering = this._hoverBar === true;
@@ -1017,12 +1173,29 @@ app.registerExtension({
       ctx.textBaseline = "alphabetic";
     }
 
-    /** 底部模式条的命中判定 */
-    const barAt = function (node, pos) {
-      const b = node._modeBar;
-      if (!b) return false;
-      return pos[0] >= b.x && pos[0] <= b.x + b.w && pos[1] >= b.y && pos[1] <= b.y + b.h;
-    };
+/** 底部模式条的命中判定 */
+const barAt = function (node, pos) {
+  const b = node._modeBar;
+  if (!b) return false;
+  return pos[0] >= b.x && pos[0] <= b.x + b.w && pos[1] >= b.y && pos[1] <= b.y + b.h;
+};
+
+/** 底部缩放条的命中判定 */
+const scaleBarAt = function (node, pos) {
+  const b = node._scaleBar;
+  if (!b) return false;
+  return pos[0] >= b.x && pos[0] <= b.x + b.w && pos[1] >= b.y && pos[1] <= b.y + b.h;
+};
+
+/**
+ * 点击缩放条：在预设档位间循环（关闭 -> 0.5 -> 1 -> 1.5 -> 2 -> 4 -> 关闭）。
+ * 循环到下一个严格大于当前值的预设；已是最高档则回到 0（关闭）。
+ */
+const cycleScale = function (node) {
+  const cur = getMegapixels(node);
+  const next = SCALE_PRESETS.find((p) => p > cur + 1e-6);
+  setMegapixels(node, next == null ? 0 : next);
+};
 
     // ------------------------------------------------------------ 鼠标
     /** 格子命中判定：图片格 0..n-1，加号格固定是 n */
@@ -1121,6 +1294,11 @@ app.registerExtension({
         this._hoverBar = onBar;
         this.setDirtyCanvas(true, true);
       }
+      const onScale = scaleBarAt(this, pos);
+      if (onScale !== this._hoverScaleBar) {
+        this._hoverScaleBar = onScale;
+        this.setDirtyCanvas(true, true);
+      }
       return origMove?.apply(this, arguments);
     };
 
@@ -1151,6 +1329,12 @@ app.registerExtension({
 
     const origDown = nodeType.prototype.onMouseDown;
     nodeType.prototype.onMouseDown = function (e, pos) {
+      // 底部缩放条：左键在预设档位间循环；右键交给菜单（不拦截）
+      if (e?.button === 0 && scaleBarAt(this, pos)) {
+        cycleScale(this);
+        return true;
+      }
+
       // 底部模式条：左键在「自动 / 关闭」间切换；有手动目标时先清掉手动目标
       if (barAt(this, pos)) {
         if (this._qwenManualTarget) {

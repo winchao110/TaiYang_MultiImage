@@ -1,10 +1,12 @@
 import json
+import math
 import os
 
 import folder_paths
 import numpy as np
 import torch
 import torchaudio
+from comfy.utils import common_upscale
 from PIL import Image
 
 MAX_IMAGES = 16
@@ -27,6 +29,12 @@ class TaiYangMultiImageLoader:
             "required": {
                 "image_files": ("STRING", {"default": "[]", "multiline": False}),
                 "auto_link": (["自动", "TextEncodeQwenImage21", "TextEncodeQwenImageEditPlus", "关闭"], {"default": "自动"}),
+                "upscale_method": (["nearest-exact", "bilinear", "area", "bicubic", "lanczos"], {"default": "bilinear"}),
+                # 0 = 不缩放（保持原分辨率）。>0 时按总像素数等比缩放。
+                "megapixels": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 16.0, "step": 0.05}),
+            },
+            "optional": {
+                "resolution_steps": ("INT", {"default": 1, "min": 1, "max": 256, "advanced": True}),
             },
         }
 
@@ -61,13 +69,44 @@ class TaiYangMultiImageLoader:
         arr = np.array(img).astype(np.float32) / 255.0
         return torch.from_numpy(arr)[None,]
 
-    def load_images(self, image_files, auto_link="自动"):
+    def _scale_to_total_pixels(self, img, upscale_method, megapixels, resolution_steps):
+        """把单张图缩放到「总像素数 = megapixels × 1024²」，等价于内置 ImageScaleToTotalPixels。
+
+        做法与内置节点一致：先按面积比算缩放系数，再把宽高各自对齐到
+        resolution_steps 的整数倍（避免缩出奇怪尺寸），最后用 common_upscale 重采样。
+        megapixels <= 0 时表示不缩放，原样返回。
+        """
+        if megapixels is None or megapixels <= 0:
+            return img
+
+        # img 是 [B, H, W, C]，common_upscale 要 [B, C, H, W]
+        # 注意 movedim(-1,1) 后 shape[2]=H、shape[3]=W，别取反了
+        samples = img.movedim(-1, 1)
+        total = float(megapixels) * 1024 * 1024
+        height = samples.shape[2]
+        width = samples.shape[3]
+        if height <= 0 or width <= 0:
+            return img
+
+        scale_by = math.sqrt(total / (width * height))
+        steps = max(1, int(resolution_steps or 1))
+        # 对齐到 steps 的整数倍；至少保留 steps，防止极端参数缩成 0
+        new_w = max(steps, int(round(width * scale_by / steps)) * steps)
+        new_h = max(steps, int(round(height * scale_by / steps)) * steps)
+
+        out = common_upscale(samples, new_w, new_h, upscale_method, "disabled")
+        return out.movedim(1, -1)  # 还原成 [B, H, W, C]
+
+    def load_images(self, image_files, auto_link="自动", upscale_method="bilinear",
+                    megapixels=0.0, resolution_steps=1):
         files = self._parse_files(image_files)
         results = []
         for i in range(MAX_IMAGES):
             if i < len(files):
                 try:
-                    results.append(self._load_one(files[i]))
+                    img = self._load_one(files[i])
+                    img = self._scale_to_total_pixels(img, upscale_method, megapixels, resolution_steps)
+                    results.append(img)
                 except Exception as e:
                     print(f"[TaiYangMultiImageLoader] 读取失败 {files[i]}: {e}")
                     results.append(None)
