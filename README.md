@@ -60,7 +60,6 @@ ComfyUI 本身已包含全部依赖（`numpy`、`torch`、`Pillow`、`folder_pat
 
 ## 已知限制
 
-- 图片文件必须位于 ComfyUI 的 `input/` 目录（或子目录）下
 - `auto_link` 自动发现模式下，一个 loader 会同时连接画布上**所有**符合条件的节点；
   如需只连某一个，请用右键菜单「指定多图目标」锁定
 
