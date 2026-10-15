@@ -159,10 +159,41 @@ class TaiYangMultiAudioLoader:
                 raw = []
         return [f for f in raw if isinstance(f, str) and f.strip()][:MAX_AUDIOS]
 
-    def _parse_trims(self, trims):
-        """把 trims widget 解析成 {文件名: (起始秒, 结束秒)}。
+    @staticmethod
+    def _norm_segment(start, end):
+        """归一化单段裁剪区间，非法/整段返回 None，否则 (start, end or None)。
 
-        结束秒为 None 或 <= 起始秒 表示「不裁剪」，此时返回 None。
+        与前端 normTrim 语义保持一致：end <= start 时视为「到结尾」，
+        这样界面上显示的「2.00s → 结尾」和实际送进模型的结果才一致。
+        """
+        try:
+            s = float(start or 0.0)
+        except Exception:
+            s = 0.0
+        if s < 0:
+            s = 0.0
+        e = None if end is None else end
+        if e is not None:
+            try:
+                e = float(e)
+            except Exception:
+                e = None
+        if e is not None and e <= s:
+            e = None
+        if s <= 0 and e is None:
+            return None  # 整段，不裁剪
+        return (s, e)
+
+    def _parse_trims(self, trims, files):
+        """把 trims widget 解析成**与 files 按位置对齐**的 [(start,end), ...]。
+
+        前端把裁剪区间存在 trims widget 里，两种格式都要认：
+          - 新格式：数组按槽位对齐，元素为 {"s":..,"e":..} / null / [s, e]。
+            这是当前前端的格式——**同名音频也能各自独立裁剪**。
+          - 旧格式：数组元素为 {"n":文件名,"s":..,"e":..}（按文件名匹配）。
+            早先版本按文件名存，这里保留兼容，别让老工作流丢区间。
+
+        返回长度与 files 一致，第 i 项对应第 i 个音频。
         """
         if isinstance(trims, (list, tuple)):
             raw = list(trims)
@@ -173,29 +204,31 @@ class TaiYangMultiAudioLoader:
                 raw = []
             if not isinstance(raw, list):
                 raw = []
-        out = {}
-        for item in raw:
-            if not isinstance(item, dict):
+
+        n = len(files)
+        out = [None] * n
+
+        # 旧格式：按文件名匹配（老工作流）
+        by_name = {}
+        for it in raw:
+            if isinstance(it, dict) and isinstance(it.get("n"), str) and it.get("n"):
+                seg = self._norm_segment(it.get("s"), it.get("e"))
+                if seg is not None:
+                    by_name[it["n"]] = seg
+        if by_name:
+            for i, f in enumerate(files):
+                if f in by_name:
+                    out[i] = by_name[f]
+            return out
+
+        # 新格式：按位置对齐
+        for i, it in enumerate(raw[:n]):
+            if it is None:
                 continue
-            name = item.get("n")
-            if not isinstance(name, str) or not name:
-                continue
-            try:
-                start = float(item.get("s", 0.0) or 0.0)
-            except Exception:
-                start = 0.0
-            end = item.get("e", None)
-            try:
-                end = None if end is None else float(end)
-            except Exception:
-                end = None
-            # 结束必须严格大于开始，否则这个区间非法 → 整段不裁剪
-            # （注意不能只把 end 置 None：那样 start>0 时会变成「start 到结尾」，语义就变了）
-            if end is not None and end <= start:
-                continue
-            if start <= 0 and end is None:
-                continue  # 整段，不用记
-            out[name] = (start, end)
+            if isinstance(it, dict):
+                out[i] = self._norm_segment(it.get("s"), it.get("e"))
+            elif isinstance(it, (list, tuple)) and len(it) >= 1:
+                out[i] = self._norm_segment(it[0], it[1] if len(it) > 1 else None)
         return out
 
     def _load_one(self, rel_path, trim=None):
@@ -222,12 +255,14 @@ class TaiYangMultiAudioLoader:
 
     def load_audios(self, audio_files, trims="[]", auto_link="自动"):
         files = self._parse_files(audio_files)
-        trim_map = self._parse_trims(trims)
+        # 裁剪区间按位置对齐：第 i 项对应第 i 个音频（同名音频也各自独立）
+        trim_list = self._parse_trims(trims, files)
         results = []
         for i in range(MAX_AUDIOS):
             if i < len(files):
                 try:
-                    results.append(self._load_one(files[i], trim_map.get(files[i])))
+                    seg = trim_list[i] if i < len(trim_list) else None
+                    results.append(self._load_one(files[i], seg))
                 except Exception as e:
                     print(f"[TaiYangMultiAudioLoader] 读取失败 {files[i]}: {e}")
                     results.append(None)
