@@ -37,7 +37,9 @@ const STATIC_TARGETS = {
       return ord >= 0 && ord < 3 ? ord : -1;
     },
   },
-  TEQwenImage21PromptEnhancer: {
+  // 注意：type 是注册名 TE_Qwen_Image_2_1_Prompt_Enhancer（带下划线），
+  // 不是 Python 类名 TEQwenImage21PromptEnhancer —— 两者不同，别写错。
+  TE_Qwen_Image_2_1_Prompt_Enhancer: {
     cap: 8,
     // 第 0 张 -> "图片"，第 1 张起带数字："图片2"
     slotName: (i) => (i === 0 ? "图片" : `图片${i + 1}`),
@@ -57,6 +59,30 @@ const STATIC_TARGETS = {
 const MODE_OPTIONS = ["自动", ...AUTOGROW_TARGETS, ...Object.keys(STATIC_TARGETS), "关闭"];
 const MODE_AUTO = 0;
 const MODE_OFF = MODE_OPTIONS.length - 1;
+
+/**
+ * 取某个节点对应的固定槽位配置。
+ *
+ * 先按 type 精确查；查不到再用**槽名特征**反查——
+ * 第三方节点的注册名（type）和 Python 类名经常不一致
+ * （TE MAN 那个就是 type=TE_Qwen_Image_2_1_Prompt_Enhancer，
+ *   而类名是 TEQwenImage21PromptEnhancer），只按 type 查很容易漏。
+ * 特征判定：该节点的输入槽里，按某套 slotName 规则能凑出至少 2 个槽。
+ */
+function staticCfgOf(node) {
+  if (!node) return null;
+  const byType = STATIC_TARGETS[node.type];
+  if (byType) return byType;
+  const names = (node.inputs || []).map((i) => i.name);
+  if (names.length < 2) return null;
+  for (const cfg of Object.values(STATIC_TARGETS)) {
+    // 前两个槽名必须都能匹配上，才算命中（避免误判）
+    if (names.includes(cfg.slotName(0)) && names.includes(cfg.slotName(1))) {
+      return cfg;
+    }
+  }
+  return null;
+}
 
 // ---------------------------------------------------------------- 布局常量
 // 格子放大一倍：65 -> 130，一屏 4 列 x 4 行 = 最多 16 张
@@ -632,7 +658,7 @@ function collectTargets(node) {
   } else if (mode === MODE_AUTO) {
     // 自动发现：任何带「多图接入 autogrow 组」的节点，或已知固定槽位节点
     candidates = (graph._nodes || []).filter(
-      (n) => n.type !== NODE_NAME && (findImageAutogrow(n) || STATIC_TARGETS[n.type])
+      (n) => n.type !== NODE_NAME && (findImageAutogrow(n) || staticCfgOf(n))
     );
   } else {
     const type = MODE_OPTIONS[mode];
@@ -659,14 +685,19 @@ function syncOneTarget(node, target, count) {
   const graph = node.graph || app.graph;
   if (!graph) return;
 
-  if (STATIC_TARGETS[target.type] && !findImageAutogrow(target)) {
+  const stCfg = staticCfgOf(target);
+  if (stCfg && !findImageAutogrow(target)) {
     // 固定槽位节点：槽名按各自规则生成（Edit Plus 是 image1/2/3，
     // TE MAN Qwen 增强是「图片」「图片2」…中文 1 基），直接找槽即可
-    const cfg = STATIC_TARGETS[target.type];
+    const cfg = stCfg;
     const cap = Math.min(count, cfg.cap);
+    let missing = 0;   // 目标槽还没建出来的数量
     for (let i = 0; i < cap; i++) {
       const idx = target.inputs.findIndex((x) => x.name === cfg.slotName(i));
-      if (idx === -1) continue;
+      if (idx === -1) {
+        missing++;
+        continue;
+      }
       connectSlot(node, i, target, idx);
     }
     // 多余的固定槽断开
@@ -679,6 +710,9 @@ function syncOneTarget(node, target, count) {
       if (idx !== -1 && inp.link != null) disconnectSlot(target, idx);
     }
     target.setDirtyCanvas?.(true, true);
+    // 目标槽缺失（工作流刚载入、对端输入槽还没初始化完）→ 记下待重试，
+    // 否则这些槽会一直空着，用户必须手动点「重新自动连线」才能补上。
+    if (missing > 0) markRetry(node);
     return;
   }
 
@@ -741,7 +775,7 @@ function syncConnections(node) {
         const link = getLink(t.graph || app.graph, inp.link);
         if ((link?.origin_id ?? null) !== node.id) continue;
         const isAutoSlot = ag && isGroupSlot(ag.prefix, inp.name);
-        const st = STATIC_TARGETS[t.type];
+        const st = staticCfgOf(t);
         const isStaticSlot = !!st && st.slotOrder(inp.name) >= 0;
         if (!isAutoSlot && !isStaticSlot) continue;
         const idx = t.inputs.indexOf(inp);
@@ -758,6 +792,8 @@ function syncConnections(node) {
     console.debug("[TaiYangMultiImage] 未找到可连接的多图接入目标节点");
     // 没有目标节点时也要让输出槽跟着图片数走
     syncOutputSlots(node, files.length);
+    // 对端节点可能还没建好输入槽，先记一次补试
+    markRetry(node);
     return;
   }
 
@@ -765,7 +801,10 @@ function syncConnections(node) {
   // 少了第一步，第 N 张图连线时 outputs[N-1] 还不存在，connectSlot 会静默失败
   //（表现为最后一张图始终连不上）。
   growOutputSlots(node, files.length);
+  const before = node._retryCount || 0;
   for (const t of targets) syncOneTarget(node, t, files.length);
+  // 一次同步下来没有产生新的补试请求 -> 说明都连上了，清零计数
+  if ((node._retryCount || 0) === before) clearRetry(node);
   // 收尾统一调整输出槽数量：几张图就显示几个 image_N
   syncOutputSlots(node, files.length);
 }
@@ -779,6 +818,34 @@ function syncAllLoaders() {
     if (getImageFiles(n).length === 0) continue;
     syncConnections(n);
   }
+}
+
+// ---------------------------------------------------------------- 连线补试
+// 工作流刚载入时，对端节点（尤其第三方节点）的输入槽可能还没初始化完，
+// 那时 syncConnections 找不到目标槽会静默跳过，导致一直连不上。
+// 这里用「延迟 + 有限次数」补试，成功后自动停止。
+
+const RETRY_DELAYS = [120, 400, 1000, 2200, 4000];  // ms
+const RETRY_MAX = RETRY_DELAYS.length;
+
+/** 标记某个 loader 需要补试连线 */
+function markRetry(node) {
+  if (!node) return;
+  if ((node._retryCount || 0) >= RETRY_MAX) return;
+  node._retryCount = (node._retryCount || 0) + 1;
+  const n = node._retryCount;
+  setTimeout(() => {
+    // 期间节点可能被删了 / 图被换掉
+    const g = app?.graph;
+    if (!g || !(g._nodes || []).includes(node)) return;
+    if (getImageFiles(node).length === 0) return;
+    syncConnections(node);
+  }, RETRY_DELAYS[n - 1] || RETRY_DELAYS[RETRY_DELAYS.length - 1]);
+}
+
+/** 连线成功后清零计数（用户手动改图/拖拽时也要重置） */
+function clearRetry(node) {
+  if (node) node._retryCount = 0;
 }
 
 // ---------------------------------------------------------------- 上传
@@ -810,7 +877,7 @@ app.registerExtension({
         const r = origTargetCreated ? origTargetCreated.apply(this, arguments) : undefined;
         setTimeout(() => {
           // 只有确实带「多图接入 autogrow 组」的节点才触发反向连线
-          if (findImageAutogrow(this) || STATIC_TARGETS[this.type]) syncAllLoaders();
+          if (findImageAutogrow(this) || staticCfgOf(this)) syncAllLoaders();
         }, 80);
         return r;
       };
@@ -912,8 +979,13 @@ app.registerExtension({
       if (this.size[0] < NODE_W) this.size[0] = NODE_W;
       this.setDirtyCanvas?.(true, true);
 
-      // 载入后按已保存的连线重建一次缺失的槽位
-      setTimeout(() => syncConnections(this), 0);
+      // 载入后按已保存的连线重建一次缺失的槽位。
+      // 不能只跑一次：工作流刚打开时对端节点（尤其第三方节点）的输入槽
+      // 可能还没初始化完，那一轮会找不到目标槽而静默跳过。
+      // 所以这里也走 markRetry —— 由它按 120ms/400ms/1s/2.2s/4s 补试，
+      // 连上即停，不会无限重试。
+      this._retryCount = 0;
+      syncConnections(this);
       return r;
     };
 
@@ -955,7 +1027,7 @@ app.registerExtension({
       );
       const capable = present.filter((t) => {
         const n = (graph._nodes || []).find((x) => x.type === t);
-        return n && (findImageAutogrow(n) || STATIC_TARGETS[t]);
+        return n && (findImageAutogrow(n) || staticCfgOf(n));
       });
       const others = present.filter((t) => !capable.includes(t));
 
