@@ -1162,8 +1162,8 @@ app.registerExtension({
       const sby = HEADER_H + GRID_H + BAR_GAP;
       const mp = getMegapixels(this);
       const steps = getResolutionSteps(this);
-      // 左区要放得下「缩放图像：0(百万像素，填0不缩放)」，所以左区给 62% 宽
-      const splitX = sbx + sbw * 0.62;
+      // 左区要放得下「缩放图像 0 百万像素(填0不缩放)」，左区给 58% 宽
+      const splitX = sbx + sbw * 0.58;
       this._scaleBar = { x: sbx, y: sby, w: sbw, h: SCALE_BAR_H };
       this._scaleMpZone = { x: sbx, y: sby, w: splitX - sbx, h: SCALE_BAR_H };
       this._scaleStepsZone = { x: splitX, y: sby, w: sbx + sbw - splitX, h: SCALE_BAR_H };
@@ -1177,7 +1177,7 @@ app.registerExtension({
       ctx.roundRect(sbx, sby, sbw, SCALE_BAR_H, 5);
       ctx.fill();
 
-      // 左区：缩放图像：<MP>(百万像素，填0不缩放)
+      // 左区：缩放图像 <N> 百万像素(填0不缩放)
       ctx.fillStyle = hoverMp ? "#3d4a58" : "#2a2f36";
       ctx.beginPath();
       ctx.roundRect(sbx, sby, splitX - sbx - 1, SCALE_BAR_H, 5);
@@ -1195,10 +1195,10 @@ app.registerExtension({
       const iconW = ctx.measureText("✎").width;
       ctx.fillText("✎", sbx + 8, barMidY);
 
-      // 「缩放图像：」固定前缀
-      const prefix = "缩放图像：";
+      // 「缩放图像」
       ctx.fillStyle = hoverMp ? "#eaf6ff" : "#c8d2dc";
       ctx.font = "12px Arial";
+      const prefix = "缩放图像 ";
       const prefixW = ctx.measureText(prefix).width;
       const px = sbx + 8 + iconW + 4;
       ctx.fillText(prefix, px, barMidY);
@@ -1210,10 +1210,10 @@ app.registerExtension({
       const valW = ctx.measureText(valText).width;
       ctx.fillText(valText, px + prefixW, barMidY);
 
-      // 固定说明后缀
+      // 「百万像素(填0不缩放)」
       ctx.fillStyle = hoverMp ? "#c8d2dc" : "#7d8894";
       ctx.font = "11px Arial";
-      ctx.fillText("(百万像素，填0不缩放)", px + prefixW + valW + 1, barMidY);
+      ctx.fillText(" 百万像素(填0不缩放)", px + prefixW + valW, barMidY);
 
       // 分隔线
       ctx.strokeStyle = "#4a5560";
@@ -1222,7 +1222,7 @@ app.registerExtension({
       ctx.lineTo(splitX, sby + SCALE_BAR_H - 4);
       ctx.stroke();
 
-      // 右区：分辨率整数倍：N（默认 32，N 表示宽高对齐 N 的整数倍）
+      // 右区：分辨率对齐N整数倍（默认 32，点击可改）
       ctx.fillStyle = hoverSteps ? "#3d4a58" : "#2a2f36";
       ctx.beginPath();
       ctx.roundRect(splitX + 1, sby, sbx + sbw - splitX - 1, SCALE_BAR_H, 5);
@@ -1233,14 +1233,22 @@ app.registerExtension({
 
       ctx.textAlign = "left";
       const sx = splitX + 8;
+      // 「分辨率对齐」
       ctx.fillStyle = hoverSteps ? "#eaf6ff" : "#c8d2dc";
       ctx.font = "11px Arial";
-      const sPrefix = "分辨率整数倍：";
+      const sPrefix = "分辨率对齐";
       const sPrefixW = ctx.measureText(sPrefix).width;
       ctx.fillText(sPrefix, sx, barMidY);
+      // 数值（高亮，一眼看到当前值）
       ctx.fillStyle = hoverSteps ? "#eaf6ff" : "#8fd0ff";
-      ctx.font = "bold 11px Arial";
-      ctx.fillText(String(steps), sx + sPrefixW, barMidY);
+      ctx.font = "bold 12px Arial";
+      const sVal = String(steps);
+      const sValW = ctx.measureText(sVal).width;
+      ctx.fillText(sVal, sx + sPrefixW, barMidY);
+      // 「整数倍」
+      ctx.fillStyle = hoverSteps ? "#eaf6ff" : "#c8d2dc";
+      ctx.font = "11px Arial";
+      ctx.fillText("整数倍", sx + sPrefixW + sValW, barMidY);
       ctx.textBaseline = "alphabetic";
 
       // ---------------------------------------------------------- 底部模式条
