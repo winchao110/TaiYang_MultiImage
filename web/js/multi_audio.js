@@ -219,6 +219,9 @@ function setAudios(node, files) {
   if (node.size && node.size[0] < MIN_NODE_W) node.size[0] = MIN_NODE_W;
   // 音频列表变了：清掉已不存在文件的裁剪区间与缓存，避免残留脏数据
   pruneTrims(node);
+  // **预取新增音频的时长**：新上传的音频必须有时长才会画裁剪竖线与时间刻度。
+  // （以前只在 onNodeCreated/onConfigure 里取，上传的音频一直没取到 → 不显示竖线）
+  (list || []).forEach((n) => getDuration(node, n));
   node.setDirtyCanvas(true, true);
 }
 
@@ -327,6 +330,9 @@ function getDuration(node, name) {
       done = true;
       cache[name] = v;      // null 表示读不到
       el.src = "";
+      // 时长是异步读到的：拿到后必须重绘，否则竖线/刻度不会画出来
+      // （新上传的音频最初 dur=0 走的是「未知时长」分支）
+      node.setDirtyCanvas?.(true, true);
       resolve(v);
     };
     el.preload = "metadata";
@@ -344,6 +350,30 @@ function getDuration(node, name) {
 /** 音频访问 URL（与上传接口的 type=input 对应） */
 function audioUrl(name) {
   return `/api/view?filename=${encodeURIComponent(name)}&type=input`;
+}
+
+/**
+ * 选时间刻度的间隔（秒）。
+ * 目标：相邻刻度至少相距 34px，且刻度总数不超过 8 个——
+ * 格子只有一百多像素宽，刻度太多会糊成一片（3秒音频按 1 秒一格会有 4 个，
+ * 但 30 秒若按 1 秒一格就是 31 个，必须往上跳）。
+ * 只在 1/2/5/10/15/30/60 这些「人类友好」的整数里挑，不出现 0.37 这种。
+ * @param {number} dur 音频总时长（秒）
+ * @param {number} width 波形区宽度（px）
+ */
+function pickRulerStep(dur, width) {
+  if (!(dur > 0) || !(width > 0)) return 1;
+  const MIN_PX = 34;
+  const MAX_TICKS = 8;
+  const candidates = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
+  for (const c of candidates) {
+    if ((c / dur) * width >= MIN_PX && dur / c <= MAX_TICKS) return c;
+  }
+  // 候选都太密 -> 取能落在 MAX_TICKS 以内的最大间隔
+  for (const c of candidates) {
+    if (dur / c <= MAX_TICKS) return c;
+  }
+  return candidates[candidates.length - 1];
 }
 
 /** 正在试听的 {name, start, end, el} */
@@ -968,6 +998,36 @@ app.registerExtension({
         },
       });
 
+      // 裁剪区间相关：全部重置 / 单条重置
+      const trimsNow = readTrims(this);
+      if (Object.keys(trimsNow).length > 0) {
+        items.push({
+          content: "↺ 重置所有裁剪区间（恢复整段）",
+          callback: () => {
+            writeTrims(this, {});
+            this.setDirtyCanvas(true, true);
+          },
+        });
+        const trimmedNames = (this._audios || []).filter((n) => trimsNow[n]);
+        if (trimmedNames.length) {
+          items.push({
+            content: "✂ 重置某条音频的裁剪区间",
+            callback: () =>
+              items.push(
+                ...trimmedNames.map((n) => ({
+                  content: `　${truncateName(n, 18)}`,
+                  callback: () => {
+                    const m = readTrims(this);
+                    delete m[n];
+                    writeTrims(this, m);
+                    this.setDirtyCanvas(true, true);
+                  },
+                }))
+              ),
+          });
+        }
+      }
+
       if (capable.length) {
         items.push({
           content: `🎯 指定多音频目标${this._audioManualTarget ? `（当前：${this._audioManualTarget}）` : ""}`,
@@ -1124,12 +1184,14 @@ app.registerExtension({
         const playing = this._playing === name;
 
         const FILEBAR_H = 18;       // 底部文件名条
+        const RULER_H = 13;         // 波形区下方的时间刻度带
         const waveTop = y + 26;     // 波形区上沿（留出顶部标题空间）
-        const waveH = cell - 26 - FILEBAR_H - 4;
+        const waveH = cell - 26 - RULER_H - FILEBAR_H - 4;
         const waveX = x + 8;
         const waveW = cell - 16;
+        const rulerY = waveTop + waveH;  // 刻度带顶沿
 
-        // 格子底部：区间秒数
+        // 格子底部：文件名
         ctx.fillStyle = "rgba(220,230,240,0.85)";
         ctx.font = "11px Arial";
         ctx.textAlign = "center";
@@ -1219,6 +1281,32 @@ app.registerExtension({
           ctx.font = "10px Arial";
           ctx.textAlign = "right";
           ctx.fillText(seg, x + cell - 8, waveTop - 4);
+
+          // ------------------------------------------------------------
+          // 时间刻度（秒）：波形区正下方一排刻度线 + 秒数
+          // 间隔按时长自动选 1/2/5 秒，保证刻度不挤在一起。
+          // ------------------------------------------------------------
+          const stepSec = pickRulerStep(dur, waveW);
+          ctx.font = "9px Arial";
+          ctx.textAlign = "center";
+          ctx.textBaseline = "middle";
+          for (let sec = 0; sec <= dur + 1e-6; sec += stepSec) {
+            const px = waveX + (sec / dur) * waveW;
+            // 刻度线
+            ctx.strokeStyle = "rgba(140,160,180,0.5)";
+            ctx.lineWidth = 1;
+            ctx.beginPath();
+            ctx.moveTo(px, rulerY + 1);
+            ctx.lineTo(px, rulerY + 4);
+            ctx.stroke();
+            // 秒数（两端贴着边界，稍微内缩避免溢出格子）
+            const isEnd = sec + stepSec > dur + 1e-6;
+            const label = isEnd ? `${dur.toFixed(dur < 10 ? 1 : 0)}s` : `${sec}`;
+            const lx = isEnd ? Math.min(px, x + cell - 14) : px;
+            ctx.fillStyle = "rgba(190,205,220,0.85)";
+            ctx.fillText(label, lx, rulerY + 8.5);
+          }
+          ctx.textBaseline = "alphabetic";
         }
 
         // 序号角标
