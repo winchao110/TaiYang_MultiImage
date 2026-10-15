@@ -46,7 +46,8 @@
 | `TextEncodeQwenImage21` | TemplateNames（1 基） | `images.image_1` |
 | `MiniMaxH3ReferenceToVideo` | TemplatePrefix（0 基） | `ref_images.ref_image_0` |
 | `MiniMaxH3MaterialPromptStar7` | TemplatePrefix（0 基） | `ref_images.ref_image_0` |
-| `TextEncodeQwenImageEditPlus` | 固定槽位 | `image1` / `image2` / `image3` |
+| `TextEncodeQwenImageEditPlus` | 固定槽位（3） | `image1` / `image2` / `image3` |
+| `TEQwenImage21PromptEnhancer`<br>（TE MAN Qwen Image 2.1 AI提示词增强） | 固定槽位（8，中文 1 基） | `图片` / `图片2` … `图片8` |
 
 - **自动发现**：扫描画布，任何带 `images` / `ref_images` autogrow 组的节点都会被接入
 - **手动指定**：右键菜单可锁定某个节点类型，或指定白名单外的任意节点

@@ -17,11 +17,42 @@ const MAX_IMAGES = 16;
  *    注意两个 H3 节点都有 IMAGE 类型的 "ref_videos" 组（视频帧），
  *    必须靠组名白名单排除，绝不能只按槽类型 IMAGE 匹配，否则会把
  *    参考图错接到视频帧槽上。
- * B) STATIC_TARGETS：固定槽位（如 Edit Plus 的 image1/2/3）。
+ * B) STATIC_TARGETS：固定槽位节点（非 autogrow）。
+ *    - 槽位名由 slotName(i) 生成（i 从 0 开始）
+ *    - Edit Plus 是 image1/2/3；TE MAN Qwen 增强是「图片」「图片2」…（中文、1 基）
+ *    所以命名规则必须可配置，不能写死 image${i+1}。
  */
 const AUTOGROW_GROUPS = ["images", "ref_images"];
 const AUTOGROW_TARGETS = ["TextEncodeQwenImage21"];
-const STATIC_TARGETS = { TextEncodeQwenImageEditPlus: 3 };
+const STATIC_TARGETS = {
+  TextEncodeQwenImageEditPlus: {
+    cap: 3,
+    // 第 0 张 -> "image1"
+    slotName: (i) => `image${i + 1}`,
+    // 反解槽位序号：image3 -> 2；超出 cap 视为不属于本节点
+    slotOrder: (name) => {
+      const m = /^image(\d+)$/.exec(name);
+      if (!m) return -1;
+      const ord = parseInt(m[1], 10) - 1;
+      return ord >= 0 && ord < 3 ? ord : -1;
+    },
+  },
+  TEQwenImage21PromptEnhancer: {
+    cap: 8,
+    // 第 0 张 -> "图片"，第 1 张起带数字："图片2"
+    slotName: (i) => (i === 0 ? "图片" : `图片${i + 1}`),
+    // 反解："图片" -> 0，"图片5" -> 4；超出 cap（如"图片10"）视为不属于本节点
+    slotOrder: (name) => {
+      let ord = -1;
+      if (name === "图片") ord = 0;
+      else {
+        const m = /^图片(\d+)$/.exec(name);
+        if (m) ord = parseInt(m[1], 10) - 1;
+      }
+      return ord >= 0 && ord < 8 ? ord : -1;
+    },
+  },
+};
 
 const MODE_OPTIONS = ["自动", ...AUTOGROW_TARGETS, ...Object.keys(STATIC_TARGETS), "关闭"];
 const MODE_AUTO = 0;
@@ -629,19 +660,21 @@ function syncOneTarget(node, target, count) {
   if (!graph) return;
 
   if (STATIC_TARGETS[target.type] && !findImageAutogrow(target)) {
-    // Edit Plus 的 image1/2/3 是节点 schema 里固定声明的输入槽，直接找即可
-    const cap = Math.min(count, STATIC_TARGETS[target.type]);
+    // 固定槽位节点：槽名按各自规则生成（Edit Plus 是 image1/2/3，
+    // TE MAN Qwen 增强是「图片」「图片2」…中文 1 基），直接找槽即可
+    const cfg = STATIC_TARGETS[target.type];
+    const cap = Math.min(count, cfg.cap);
     for (let i = 0; i < cap; i++) {
-      const idx = target.inputs.findIndex((x) => x.name === `image${i + 1}`);
+      const idx = target.inputs.findIndex((x) => x.name === cfg.slotName(i));
       if (idx === -1) continue;
       connectSlot(node, i, target, idx);
     }
     // 多余的固定槽断开
     const snapshot = target.inputs.slice();
     for (const inp of snapshot) {
-      if (!/^image\d+$/.test(inp.name)) continue;
-      const ord = parseInt(inp.name.slice(5), 10) - 1;
-      if (ord < cap) continue;
+      const ord = cfg.slotOrder(inp.name);
+      if (ord < 0) continue;          // 不是本节点的图片槽
+      if (ord < cap) continue;        // 仍在用，保留
       const idx = target.inputs.indexOf(inp);
       if (idx !== -1 && inp.link != null) disconnectSlot(target, idx);
     }
@@ -708,7 +741,8 @@ function syncConnections(node) {
         const link = getLink(t.graph || app.graph, inp.link);
         if ((link?.origin_id ?? null) !== node.id) continue;
         const isAutoSlot = ag && isGroupSlot(ag.prefix, inp.name);
-        const isStaticSlot = STATIC_TARGETS[t.type] && /^image\d+$/.test(inp.name);
+        const st = STATIC_TARGETS[t.type];
+        const isStaticSlot = !!st && st.slotOrder(inp.name) >= 0;
         if (!isAutoSlot && !isStaticSlot) continue;
         const idx = t.inputs.indexOf(inp);
         if (idx !== -1) disconnectSlot(t, idx);
