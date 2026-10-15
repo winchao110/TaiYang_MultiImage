@@ -77,6 +77,36 @@ const WIDGET_TOP_GAP = HEADER_H + GRID_H;
 const WIDGET_H = 34;
 const NODE_W = START_X * 2 + COLS * CELL + (COLS - 1) * GAP + RIGHT_PAD;
 const NODE_H = WIDGET_TOP_GAP + WIDGET_H + 10;
+// 底部auto_link 条的高度
+const BAR_H = 24;
+const BAR_GAP = 6;
+// 底部控件区总高度
+const BOTTOM_BLOCK_H = BAR_H + BAR_GAP * 2;
+/**
+ * 节点最小尺寸：底部控件不能压到网格上，也不能互相重叠。
+ */
+const MIN_NODE_H = WIDGET_TOP_GAP + BOTTOM_BLOCK_H;
+const MIN_NODE_W = 320;
+
+/**
+ * 底部 auto_link 条布局：**贴着节点实际底边往上排**。
+ * 用户手动缩放节点时，控件跟着底边一起动，而不是钉在固定坐标上。
+ */
+function bottomLayout(nodeH) {
+  return { modeY: nodeH - BAR_H - BAR_GAP };
+}
+
+/**
+ * 钳制节点尺寸到最小值。
+ * 缩得太小会让底部控件压到网格上（控件相互覆盖），所以这里兜一个下限。
+ */
+function clampNodeSize(node) {
+  const s = node?.size;
+  if (!s) return node;
+  if (!(s[0] >= MIN_NODE_W)) s[0] = MIN_NODE_W;
+  if (!(s[1] >= MIN_NODE_H)) s[1] = MIN_NODE_H;
+  return node;
+}
 
 // ---------------------------------------------------------------- 基础工具
 
@@ -623,11 +653,25 @@ app.registerExtension({
       const linkedCount = (this.outputs || []).filter((o) => (o.links || []).length > 0).length;
       syncOutputSlots(this, Math.max(this._audios.length, linkedCount));
 
+      // 同时钳住最小尺寸，避免底部控件压到网格上
+      clampNodeSize(this);
       if (this.size[0] < NODE_W) this.size[0] = NODE_W;
       if (this.size[1] < NODE_H) this.size[1] = NODE_H;
       this.setDirtyCanvas?.(true, true);
 
       setTimeout(() => syncConnections(this), 0);
+      return r;
+    };
+
+    /**
+     * 手动缩放节点时钳住最小尺寸。
+     * 缩到小于「网格 + 底部控件区」时，底部控件会和图片重叠，这里直接顶回下限。
+     */
+    const origResize = nodeType.prototype.onResize;
+    nodeType.prototype.onResize = function (size) {
+      const r = origResize ? origResize.apply(this, arguments) : undefined;
+      clampNodeSize(this);
+      this.setDirtyCanvas?.(true, true);
       return r;
     };
 
@@ -888,10 +932,11 @@ app.registerExtension({
       }
 
       // ---------------------------------------------------------- 底部模式条
-      const bw = NODE_W - 24;
-      const bh = 24;
+      // 宽度跟随节点实际宽度，位置用 bottomLayout 贴着节点底边（随缩放一起动）。
+      const bw = Math.max(80, this.size[0] - 24);
+      const bh = BAR_H;
       const bx = 12;
-      const by = HEADER_H + GRID_H + 8;
+      const by = bottomLayout(this.size[1]).modeY;
       this._modeBar = { x: bx, y: by, w: bw, h: bh };
 
       const hovering = this._hoverBar === true;

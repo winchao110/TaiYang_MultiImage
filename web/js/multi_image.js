@@ -97,6 +97,39 @@ const NODE_W = START_X * 2 + COLS * CELL + (COLS - 1) * GAP + RIGHT_PAD;
 // 节点高度 = 标题 + 网格 + 缩放条 + auto_link 条
 const NODE_H = WIDGET_TOP_GAP + SCALE_BAR_H + BAR_H + BAR_GAP * 2 + 10;
 
+// 底部两条控件的总占用高度（缩放条 + auto_link 条 + 两个间距）
+const BOTTOM_BLOCK_H = SCALE_BAR_H + BAR_H + BAR_GAP * 2;
+/**
+ * 节点最小尺寸：底部控件不能互相覆盖，也不能压到网格上。
+ * 宽度下限保证底部两条控件都有足够横向空间；
+ * 高度下限 = 网格底部 + 控件区，保证控件与图片不重叠。
+ */
+const MIN_NODE_H = WIDGET_TOP_GAP + BOTTOM_BLOCK_H;
+const MIN_NODE_W = 320;
+
+/**
+ * 底部控件布局：**贴着节点实际底边往上排**。
+ * 这样用户手动缩放节点时，两条控件会跟着底边一起动，而不是钉在固定坐标上。
+ * @param {number} nodeH 节点实际高度（node.size[1]）
+ */
+function bottomLayout(nodeH) {
+  const modeY = nodeH - BAR_H - BAR_GAP;      // auto_link 条
+  const scaleY = modeY - BAR_GAP - SCALE_BAR_H; // 缩放条（在 auto_link 条上方）
+  return { scaleY, modeY };
+}
+
+/**
+ * 钳制节点尺寸到最小值。
+ * 缩得太小会让底部两条控件与网格重叠（控件互相覆盖），所以这里兜一个下限。
+ */
+function clampNodeSize(node) {
+  const s = node?.size;
+  if (!s) return node;
+  if (!(s[0] >= MIN_NODE_W)) s[0] = MIN_NODE_W;
+  if (!(s[1] >= MIN_NODE_H)) s[1] = MIN_NODE_H;
+  return node;
+}
+
 // ---------------------------------------------------------------- 基础工具
 
 function getWidget(node, name) {
@@ -822,13 +855,27 @@ app.registerExtension({
       syncOutputSlots(this, Math.max(files.length, linkedCount));
 
       // 老工作流存的是旧的节点尺寸（没留输出槽标签的位置），这里强制拉齐，
-      // 否则载入后右侧标签仍会压在图片上。
+      // 否则载入后右侧标签仍会压在图片上；同时钳住最小尺寸，避免控件重叠。
+      clampNodeSize(this);
       if (this.size[0] < NODE_W) this.size[0] = NODE_W;
       if (this.size[1] < NODE_H) this.size[1] = NODE_H;
       this.setDirtyCanvas?.(true, true);
 
       // 载入后按已保存的连线重建一次缺失的槽位
       setTimeout(() => syncConnections(this), 0);
+      return r;
+    };
+
+    /**
+     * 手动缩放节点时钳住最小尺寸。
+     * 缩到小于「网格 + 底部控件区」时，底部两条控件会和图片/彼此重叠，
+     * 这里直接顶回下限，用户拖不动更小。
+     */
+    const origResize = nodeType.prototype.onResize;
+    nodeType.prototype.onResize = function (size) {
+      const r = origResize ? origResize.apply(this, arguments) : undefined;
+      clampNodeSize(this);
+      this.setDirtyCanvas?.(true, true);
       return r;
     };
 
@@ -1185,9 +1232,10 @@ app.registerExtension({
       // ---------------------------------------------------------- 底部缩放条
       // 等价内置 ImageScaleToTotalPixels：按总像素数缩放。
       // 左区=目标百万像素，右区=分辨率整数倍，两区都可点击填任意数字。
-      const sbw = NODE_W - 24;
+      // 宽度跟随节点实际宽度，位置用 bottomLayout 贴着节点底边（随缩放一起动）。
+      const sbw = Math.max(80, this.size[0] - 24);
       const sbx = 12;
-      const sby = HEADER_H + GRID_H + BAR_GAP;
+      const { scaleY: sby, modeY } = bottomLayout(this.size[1]);
       const mp = getMegapixels(this);
       const steps = getResolutionSteps(this);
       // 左区要放得下「缩放图像 0 百万像素(填0不缩放)」，左区给 58% 宽
@@ -1282,10 +1330,11 @@ app.registerExtension({
       // ---------------------------------------------------------- 底部模式条
       // auto_link 不再用 widget 渲染（widget 会生成 DOM 覆盖层挡住网格），
       // 改为自绘：点一下在「自动 / 关闭」之间切换，长按菜单里可细选。
-      const bw = NODE_W - 24;
+      // 宽度跟随节点实际宽度，位置用 bottomLayout 算出的 modeY（贴底）。
+      const bw = Math.max(80, this.size[0] - 24);
       const bh = BAR_H;
       const bx = 12;
-      const by = sby + SCALE_BAR_H + BAR_GAP;
+      const by = modeY;
       this._modeBar = { x: bx, y: by, w: bw, h: bh };
 
       const hovering = this._hoverBar === true;
