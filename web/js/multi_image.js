@@ -49,8 +49,7 @@ const DRAG_THRESHOLD = 8;
 // ---------------------------------------------------------------- 缩放（等价内置 ImageScaleToTotalPixels）
 // 与内置节点一致：按「总像素数 = megapixels × 1024²」等比缩放，宽高对齐到
 // resolution_steps 的整数倍。0 表示不缩放，保持原分辨率。
-// 常用预设，交互条在预设间循环切换，右键菜单可精确设置。
-const SCALE_PRESETS = [0, 0.5, 1, 1.5, 2, 4];
+// 两项都支持填任意数字：点底部缩放条（左=MP、右=倍数）或右键菜单。
 const UPSCALE_METHODS = ["nearest-exact", "bilinear", "area", "bicubic", "lanczos"];
 
 // ---------------------------------------------------------------- 拖拽排序（纯逻辑）
@@ -137,7 +136,7 @@ function getMegapixels(node) {
 
 function setMegapixels(node, mp) {
   const w = getWidget(node, "megapixels");
-  if (w) w.value = Math.max(0, Number(mp) || 0);
+  if (w) w.value = clampMegapixels(mp);
   node.setDirtyCanvas?.(true, true);
 }
 
@@ -152,11 +151,63 @@ function setUpscaleMethod(node, m) {
   node.setDirtyCanvas?.(true, true);
 }
 
+/** 分辨率倍数（对齐步长）。默认 32，可任意填数字 */
+const DEFAULT_STEPS = 32;
+
+function getResolutionSteps(node) {
+  const w = getWidget(node, "resolution_steps");
+  const v = Math.round(Number(w?.value));
+  return Number.isFinite(v) && v >= 1 ? v : DEFAULT_STEPS;
+}
+
+function setResolutionSteps(node, n) {
+  const w = getWidget(node, "resolution_steps");
+  const v = Math.round(Number(n));
+  if (w) w.value = Number.isFinite(v) && v >= 1 ? v : DEFAULT_STEPS;
+  node.setDirtyCanvas?.(true, true);
+}
+
+/** 百万像素上限（与后端 widget 的 max=16 保持一致），0 表示关闭缩放 */
+function clampMegapixels(mp) {
+  const v = Number(mp);
+  if (!Number.isFinite(v) || v < 0) return 0;
+  return Math.min(v, 16);
+}
+
+/** 数字显示去掉多余小数位：1.0 -> 1，1.25 -> 1.25 */
+function trimNum(v) {
+  if (!Number.isFinite(v)) return String(v);
+  return String(Math.round(v * 1000) / 1000);
+}
+
+/**
+ * 弹窗输入一个数字。用浏览器原生 prompt：
+ * 画布外的系统弹窗，不会像 widget 那样生成 DOM 覆盖层压住自绘网格
+ * （这个节点的坑，见 onNodeCreated 里的注释）。
+ * @returns {number|null} 确认后返回数字；取消/非法输入返回 null
+ */
+function promptNumber(title, current, { min, max, step = 1, integer = false }) {
+  const msg = `${title}\n当前：${current}${integer ? "" : ""}`;
+  const raw = window.prompt(msg, String(current));
+  if (raw == null) return null;
+  const trimmed = String(raw).trim();
+  if (trimmed === "") return null;
+  let v = Number(trimmed);
+  if (!Number.isFinite(v)) {
+    window.alert("输入的不是有效数字，已取消修改。");
+    return null;
+  }
+  if (integer) v = Math.round(v);
+  if (v < min) v = min;
+  if (v > max) v = max;
+  return v;
+}
+
 /**
  * 推算缩放后的实际尺寸（与后端 _scale_to_total_pixels 同一套公式）。
  * megapixels<=0 时返回原尺寸。这样格子里显示的分辨率 = 真正送进模型的分辨率。
  */
-function scaledSize(natW, natH, megapixels, resolutionSteps = 1) {
+function scaledSize(natW, natH, megapixels, resolutionSteps = DEFAULT_STEPS) {
   if (!natW || !natH || megapixels <= 0) return [natW, natH];
   const total = megapixels * 1024 * 1024;
   const scaleBy = Math.sqrt(total / (natW * natH));
@@ -675,6 +726,8 @@ app.registerExtension({
       this._gridPos = null;
       this._hoverCell = -1;
       this._hoverScaleBar = false;
+      this._hoverScaleMp = false;
+      this._hoverScaleSteps = false;
       // 拖拽状态（统一模型，见「拖拽排序（纯逻辑）」）：
       //   _press      已按下待判定 { from, x, y }
       //   _drag       已确认拖拽 { from, to }
@@ -810,13 +863,6 @@ app.registerExtension({
         { content: "　↩ 回到自动发现", callback: () => backToAuto(node) },
       ];
 
-      // 缩放档位菜单行：选中即写入 megapixels widget（0 = 关闭缩放）
-      const mpRows = (presets, node) =>
-        presets.map((p) => ({
-          content: `${p === 0 ? "关闭缩放" : `${p} MP`}${getMegapixels(node) === p ? "  ✓当前" : ""}`,
-          callback: () => setMegapixels(node, p),
-        }));
-
       items.push({
         content: "🔗 重新自动连线",
         callback: () => {
@@ -826,12 +872,21 @@ app.registerExtension({
       });
 
       // ---- 缩放（等价内置 ImageScaleToTotalPixels）----
-      // 底部缩放条只能循环预设，这里可以精确指定数值与插值算法。
+      // 百万像素与分辨率倍数都支持填任意数字（底部缩放条左键，或这里）
       const curMp = getMegapixels(this);
       const curMethod = getUpscaleMethod(this);
+      const curSteps = getResolutionSteps(this);
       items.push({
-        content: `🔍 缩放设置（当前：${curMp > 0 ? `${curMp} MP` : "关闭"}）`,
-        callback: () => items.push(...mpRows(SCALE_PRESETS, this)),
+        content: `🔍 缩放：输入百万像素（当前：${curMp > 0 ? `${trimNum(curMp)} MP` : "关闭"}）`,
+        callback: () => editScale(this, "mp"),
+      });
+      items.push({
+        content: `🔢 分辨率倍数：输入数字（当前：×${curSteps}）`,
+        callback: () => editScale(this, "steps"),
+      });
+      items.push({
+        content: "⏹ 关闭缩放（保持原分辨率）",
+        callback: () => setMegapixels(this, 0),
       });
       items.push({
         content: `⚙ 插值算法（当前：${curMethod}）`,
@@ -1021,7 +1076,8 @@ app.registerExtension({
         const nat = img && img.complete && img.naturalWidth > 0 ? img : null;
         if (nat) {
           const mp = getMegapixels(this);
-          const [dw, dh] = scaledSize(nat.naturalWidth, nat.naturalHeight, mp, 1);
+          // 必须用真实的 resolution_steps，否则显示的分辨率与实际送进模型的不一致
+          const [dw, dh] = scaledSize(nat.naturalWidth, nat.naturalHeight, mp, getResolutionSteps(this));
           const by = y + cell - RES_BAR_H;
           ctx.fillStyle = "rgba(12,16,20,0.82)";
           ctx.beginPath();
@@ -1104,36 +1160,64 @@ app.registerExtension({
       const sbw = NODE_W - 24;
       const sbx = 12;
       const sby = HEADER_H + GRID_H + BAR_GAP;
-      this._scaleBar = { x: sbx, y: sby, w: sbw, h: SCALE_BAR_H };
       const mp = getMegapixels(this);
       const method = getUpscaleMethod(this);
+      const steps = getResolutionSteps(this);
+      // 缩放条分左右两区：左区=百万像素（可填任意数字），右区=分辨率倍数
+      const splitX = sbx + sbw * 0.62;
+      this._scaleBar = { x: sbx, y: sby, w: sbw, h: SCALE_BAR_H };
+      this._scaleMpZone = { x: sbx, y: sby, w: splitX - sbx, h: SCALE_BAR_H };
+      this._scaleStepsZone = { x: splitX, y: sby, w: sbx + sbw - splitX, h: SCALE_BAR_H };
 
-      const scaleHover = this._hoverScaleBar === true;
-      ctx.fillStyle = scaleHover ? "#3d4a58" : "#2a2f36";
+      const hoverMp = this._hoverScaleMp === true;
+      const hoverSteps = this._hoverScaleSteps === true;
+
+      // 底板
+      ctx.fillStyle = "#2a2f36";
       ctx.beginPath();
       ctx.roundRect(sbx, sby, sbw, SCALE_BAR_H, 5);
       ctx.fill();
-      ctx.strokeStyle = scaleHover ? "#8fd0ff" : "#4a5560";
+
+      // 左区：百万像素
+      ctx.fillStyle = hoverMp ? "#3d4a58" : "#2a2f36";
+      ctx.beginPath();
+      ctx.roundRect(sbx, sby, splitX - sbx - 1, SCALE_BAR_H, 5);
+      ctx.fill();
+      ctx.strokeStyle = hoverMp ? "#8fd0ff" : "#4a5560";
       ctx.lineWidth = 1;
       ctx.stroke();
 
-      const scaleLabel =
-        mp > 0
-          ? `缩放：${mp} MP · ${method}`
-          : `缩放：关闭（保持原分辨率）· ${method}`;
-      ctx.fillStyle = scaleHover ? "#eaf6ff" : mp > 0 ? "#8fe08f" : "#c8d2dc";
+      const mpText = mp > 0 ? `${trimNum(mp)} MP` : "关闭缩放";
+      ctx.fillStyle = hoverMp ? "#eaf6ff" : mp > 0 ? "#8fe08f" : "#c8d2dc";
       ctx.font = "12px Arial";
       ctx.textAlign = "center";
       ctx.textBaseline = "middle";
-      ctx.fillText(scaleLabel, sbx + sbw / 2, sby + SCALE_BAR_H / 2 + 1);
-      // 右侧小三角，提示可点击切换
-      ctx.fillStyle = scaleHover ? "#8fd0ff" : "#7d8894";
+      ctx.fillText(mpText, (sbx + splitX) / 2, sby + SCALE_BAR_H / 2 + 1);
+      // 铅笔图标，提示可编辑
+      ctx.fillStyle = hoverMp ? "#8fd0ff" : "#7d8894";
+      ctx.font = "11px Arial";
+      ctx.fillText("✎", sbx + 12, sby + SCALE_BAR_H / 2 + 1);
+
+      // 分隔线
+      ctx.strokeStyle = "#4a5560";
       ctx.beginPath();
-      ctx.moveTo(sbx + sbw - 20, sby + SCALE_BAR_H / 2 - 4);
-      ctx.lineTo(sbx + sbw - 10, sby + SCALE_BAR_H / 2 - 4);
-      ctx.lineTo(sbx + sbw - 15, sby + SCALE_BAR_H / 2 + 3);
-      ctx.closePath();
+      ctx.moveTo(splitX, sby + 4);
+      ctx.lineTo(splitX, sby + SCALE_BAR_H - 4);
+      ctx.stroke();
+
+      // 右区：分辨率倍数
+      ctx.fillStyle = hoverSteps ? "#3d4a58" : "#2a2f36";
+      ctx.beginPath();
+      ctx.roundRect(splitX + 1, sby, sbx + sbw - splitX - 1, SCALE_BAR_H, 5);
       ctx.fill();
+      ctx.strokeStyle = hoverSteps ? "#8fd0ff" : "#4a5560";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+
+      ctx.fillStyle = hoverSteps ? "#eaf6ff" : "#c8d2dc";
+      ctx.font = "11px Arial";
+      ctx.textAlign = "center";
+      ctx.fillText(`×${steps}`, (splitX + sbx + sbw) / 2, sby + SCALE_BAR_H / 2 + 1);
       ctx.textBaseline = "alphabetic";
 
       // ---------------------------------------------------------- 底部模式条
@@ -1187,14 +1271,44 @@ const scaleBarAt = function (node, pos) {
   return pos[0] >= b.x && pos[0] <= b.x + b.w && pos[1] >= b.y && pos[1] <= b.y + b.h;
 };
 
+/** 缩放条左半区（百万像素）命中判定 */
+const scaleMpZoneAt = function (node, pos) {
+  const b = node._scaleMpZone;
+  if (!b) return false;
+  return pos[0] >= b.x && pos[0] <= b.x + b.w && pos[1] >= b.y && pos[1] <= b.y + b.h;
+};
+
+/** 缩放条右半区（分辨率倍数）命中判定 */
+const scaleStepsZoneAt = function (node, pos) {
+  const b = node._scaleStepsZone;
+  if (!b) return false;
+  return pos[0] >= b.x && pos[0] <= b.x + b.w && pos[1] >= b.y && pos[1] <= b.y + b.h;
+};
+
 /**
- * 点击缩放条：在预设档位间循环（关闭 -> 0.5 -> 1 -> 1.5 -> 2 -> 4 -> 关闭）。
- * 循环到下一个严格大于当前值的预设；已是最高档则回到 0（关闭）。
+ * 点击缩放条：弹窗输入精确数字。
+ * 左区=百万像素（0 关闭，最大 16），右区=分辨率倍数（整数，1~256）。
+ * 都用原生 prompt，不产生 DOM 覆盖层（见 onNodeCreated 里的坑注释）。
  */
-const cycleScale = function (node) {
-  const cur = getMegapixels(node);
-  const next = SCALE_PRESETS.find((p) => p > cur + 1e-6);
-  setMegapixels(node, next == null ? 0 : next);
+const editScale = function (node, zone) {
+  if (zone === "mp") {
+    const cur = getMegapixels(node);
+    const v = promptNumber("缩放：输入目标百万像素（0 = 关闭缩放）\n例如 1 表示总像素约 1024×1024", cur, {
+      min: 0,
+      max: 16,
+    });
+    if (v == null) return;
+    setMegapixels(node, v);
+    return;
+  }
+  const curSteps = getResolutionSteps(node);
+  const v = promptNumber(
+    "分辨率倍数：宽高将对齐到该数字的整数倍\n例如 32 表示宽高都是 32 的倍数",
+    curSteps,
+    { min: 1, max: 256, integer: true }
+  );
+  if (v == null) return;
+  setResolutionSteps(node, v);
 };
 
     // ------------------------------------------------------------ 鼠标
@@ -1299,6 +1413,16 @@ const cycleScale = function (node) {
         this._hoverScaleBar = onScale;
         this.setDirtyCanvas(true, true);
       }
+      const onMp = scaleMpZoneAt(this, pos);
+      if (onMp !== this._hoverScaleMp) {
+        this._hoverScaleMp = onMp;
+        this.setDirtyCanvas(true, true);
+      }
+      const onSteps = scaleStepsZoneAt(this, pos);
+      if (onSteps !== this._hoverScaleSteps) {
+        this._hoverScaleSteps = onSteps;
+        this.setDirtyCanvas(true, true);
+      }
       return origMove?.apply(this, arguments);
     };
 
@@ -1329,9 +1453,10 @@ const cycleScale = function (node) {
 
     const origDown = nodeType.prototype.onMouseDown;
     nodeType.prototype.onMouseDown = function (e, pos) {
-      // 底部缩放条：左键在预设档位间循环；右键交给菜单（不拦截）
+      // 底部缩放条：左半区改百万像素，右半区改分辨率倍数（弹窗填任意数字）
       if (e?.button === 0 && scaleBarAt(this, pos)) {
-        cycleScale(this);
+        if (scaleStepsZoneAt(this, pos)) editScale(this, "steps");
+        else if (scaleMpZoneAt(this, pos)) editScale(this, "mp");
         return true;
       }
 

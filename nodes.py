@@ -30,11 +30,12 @@ class TaiYangMultiImageLoader:
                 "image_files": ("STRING", {"default": "[]", "multiline": False}),
                 "auto_link": (["自动", "TextEncodeQwenImage21", "TextEncodeQwenImageEditPlus", "关闭"], {"default": "自动"}),
                 "upscale_method": (["nearest-exact", "bilinear", "area", "bicubic", "lanczos"], {"default": "bilinear"}),
-                # 0 = 不缩放（保持原分辨率）。>0 时按总像素数等比缩放。
-                "megapixels": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 16.0, "step": 0.05}),
+                # 0 = 不缩放（保持原分辨率）。>0 时按总像素数等比缩放，可填任意数字。
+                "megapixels": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 16.0, "step": 0.01}),
             },
             "optional": {
-                "resolution_steps": ("INT", {"default": 1, "min": 1, "max": 256, "advanced": True}),
+                # 分辨率对齐步长：宽高都对齐到该数字的整数倍
+                "resolution_steps": ("INT", {"default": 32, "min": 1, "max": 256, "advanced": True}),
             },
         }
 
@@ -89,7 +90,7 @@ class TaiYangMultiImageLoader:
             return img
 
         scale_by = math.sqrt(total / (width * height))
-        steps = max(1, int(resolution_steps or 1))
+        steps = max(1, int(resolution_steps or 32))
         # 对齐到 steps 的整数倍；至少保留 steps，防止极端参数缩成 0
         new_w = max(steps, int(round(width * scale_by / steps)) * steps)
         new_h = max(steps, int(round(height * scale_by / steps)) * steps)
@@ -98,7 +99,7 @@ class TaiYangMultiImageLoader:
         return out.movedim(1, -1)  # 还原成 [B, H, W, C]
 
     def load_images(self, image_files, auto_link="自动", upscale_method="bilinear",
-                    megapixels=0.0, resolution_steps=1):
+                    megapixels=0.0, resolution_steps=32):
         files = self._parse_files(image_files)
         results = []
         for i in range(MAX_IMAGES):
