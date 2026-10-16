@@ -28,19 +28,38 @@ const MODE_AUTO = 0;
 const MODE_OFF = MODE_OPTIONS.length - 1;
 
 // ---------------------------------------------------------------- 布局常量
-const CELL = 130;
-const GAP = 10;
-const COLS = 4;
+// 上下排列的长条形（单列）：每条音频占一整行，波形区长而扁，操作面积大。
+// 早期是 4 列方格，格子只有 130px 宽，竖线和刻度挤在一起不好点。
+const ROW_H = 64; // 每条音频长条的高度
+const ROW_GAP = 8; // 条与条之间的间距
+const COLS = 1; // 单列：一列到底
 const START_X = 20;
 const HEADER_H = 62; // 顶部标题 + 状态文字
-const GRID_ROWS = Math.ceil(MAX_AUDIOS / COLS);
-const GRID_H = GRID_ROWS * CELL + (GRID_ROWS - 1) * GAP;
-// 右侧留出输出槽标签宽度（audio_1 / audio_8），否则标签会压在最右侧格子上
+// 行数上限 = 音频数 + 1 个「添加音频」条
+const GRID_ROWS = MAX_AUDIOS + 1;
+const GRID_H = GRID_ROWS * ROW_H + (GRID_ROWS - 1) * ROW_GAP;
+// 右侧留出输出槽标签宽度（audio_1 / audio_8），否则标签会压在长条上
 const SLOT_DOT_W = 12;
 const SLOT_LABEL_W = 62;
 const RIGHT_PAD = SLOT_DOT_W + SLOT_LABEL_W;
+// 节点默认宽度：单列长条要够长才好操作，比原来的方格布局宽不少
+const NODE_W = 440;
 // 拖拽判定阈值（px）：按下后移动超过它才算真拖，单击无动作
 const DRAG_THRESHOLD = 8;
+
+/**
+ * 长条宽度：跟随节点实际宽度（用户可横向拉宽/拉窄）。
+ */
+function rowWidthOf(node) {
+  const w = node?.size?.[0] ?? NODE_W;
+  return Math.max(160, w - START_X * 2 - RIGHT_PAD);
+}
+
+/** 第 i 条的水平起点（单列，恒为 START_X） */
+const rowX = () => START_X;
+
+/** 第 i 条的垂直起点（从上往下累加） */
+const rowY = (i) => HEADER_H + i * (ROW_H + ROW_GAP);
 
 // ---------------------------------------------------------------- 拖拽排序（纯逻辑）
 // 统一模型：order[p] = 位置 p 上放的是原来第几个音频。绘制与落盘都基于这一个数组。
@@ -75,7 +94,6 @@ function reorderList(list, from, to) {
 
 const WIDGET_TOP_GAP = HEADER_H + GRID_H;
 const WIDGET_H = 34;
-const NODE_W = START_X * 2 + COLS * CELL + (COLS - 1) * GAP + RIGHT_PAD;
 const NODE_H = WIDGET_TOP_GAP + WIDGET_H + 10;
 // 底部auto_link 条的高度
 const BAR_H = 24;
@@ -86,17 +104,16 @@ const BOTTOM_BLOCK_H = BAR_H + BAR_GAP * 2;
 const MIN_NODE_W = 320;
 
 /**
- * 按**实际已用行数**算最小高度。
- * 网格只画到有内容的那几行，所以音频少时节点可以缩得很矮——
- * 只要「已用网格 + 底部控件区」能放下就行，不遮挡当前已有的音频。
+ * 按**实际条数**算最小高度。
+ * 长条只画到有内容的那几条，所以音频少时节点可以缩得很矮——
+ * 只要「已用长条 + 底部控件区」能放下就行，不遮挡当前已有的音频。
  */
 function minHeightFor(node) {
   const n = (node?._audios || []).length;
-  // 有音频就多留一个加号格的位置（加号固定排在所有音频后面）
-  const slots = n < MAX_AUDIOS ? n + 1 : n;
-  const rows = Math.max(1, Math.ceil(slots / COLS));
-  const gridH = rows * CELL + (rows - 1) * GAP;
-  return HEADER_H + gridH + BOTTOM_BLOCK_H;
+  // 有音频就多留一个「添加音频」条的位置
+  const used = Math.max(1, n < MAX_AUDIOS ? n + 1 : n);
+  const listH = used * ROW_H + (used - 1) * ROW_GAP;
+  return HEADER_H + listH + BOTTOM_BLOCK_H;
 }
 
 /**
@@ -479,6 +496,15 @@ function waveformPeaks(buf, outW) {
   for (let i = 0; i < n; i++) if (out[i] > max) max = out[i];
   if (max > 0) for (let i = 0; i < n; i++) out[i] /= max;
   return out;
+}
+
+/**
+ * 刻度秒数格式化：整数不带小数点，小数保留 1 位，并清掉浮点尾差
+ * （例如 0.30000000000000004 -> "0.3"）。
+ */
+function formatRulerSec(v) {
+  const r = Math.round(v * 10) / 10;
+  return Number.isInteger(r) ? String(r) : r.toFixed(1);
 }
 
 /**
@@ -1255,7 +1281,8 @@ app.registerExtension({
     };
 
     // ------------------------------------------------------------ 绘制
-    const GRID = { cell: CELL, gap: GAP, cols: COLS, startX: START_X, startY: HEADER_H };
+    // 单列长条：GRID 只带条高/间距/起点，宽度由节点实际宽度算（rowWidthOf）
+    const GRID = { rowH: ROW_H, gap: ROW_GAP, cols: COLS, startX: START_X, startY: HEADER_H };
 
     const origDraw = nodeType.prototype.onDrawForeground;
     nodeType.prototype.onDrawForeground = function (ctx) {
@@ -1273,8 +1300,9 @@ app.registerExtension({
       ctx.clip();
 
       const audios = this._audios || [];
-      const { cell, gap, cols, startX, startY } = GRID;
-      this._gridPos = { ...GRID };
+      const { rowH, gap, startX, startY } = GRID;
+      const rowW = rowWidthOf(this);
+      this._gridPos = { ...GRID, rowW };
 
       ctx.textAlign = "center";
       ctx.textBaseline = "alphabetic";
@@ -1287,8 +1315,7 @@ app.registerExtension({
         if (hasLive) linked++;
       }
 
-      const gridW = COLS * CELL + (COLS - 1) * GAP;
-      const centerX = START_X + gridW / 2;
+      const centerX = startX + rowW / 2;
 
       ctx.fillStyle = "#8fd0ff";
       ctx.font = "bold 13px Arial";
@@ -1326,13 +1353,14 @@ app.registerExtension({
       const toOrder = anim ? anim.toOrder : targetOrder;
       const t = anim ? anim.t : 1;
 
-      const cx = (i) => startX + (i % cols) * (cell + gap);
-      const cy = (i) => startY + Math.floor(i / cols) * (cell + gap);
+      // 单列长条：水平位置恒为 startX，垂直位置按条号累加
+      const cx = () => startX;
+      const cy = (i) => startY + i * (rowH + gap);
 
       for (let i = 0; i < count; i++) {
         const slotFrom = fromOrder.indexOf(i);
         const slotTo = toOrder.indexOf(i);
-        const x = cx(slotFrom) + (cx(slotTo) - cx(slotFrom)) * t;
+        const x = cx();
         const y = cy(slotFrom) + (cy(slotTo) - cy(slotFrom)) * t;
 
         const isHover = this._hoverCell === i;
@@ -1341,7 +1369,7 @@ app.registerExtension({
 
         ctx.fillStyle = isGrabbed ? "rgba(20,26,34,0.5)" : isShifted ? "#223244" : isHover ? "#3a3a3a" : "#1d2530";
         ctx.beginPath();
-        ctx.roundRect(x, y, cell, cell, 6);
+        ctx.roundRect(x, y, rowW, rowH, 6);
         ctx.fill();
         ctx.strokeStyle = isGrabbed
           ? "#6f7c88"
@@ -1368,19 +1396,20 @@ app.registerExtension({
         const dur = (this._durations || {})[name] || 0;
         const playing = this._playingIndex === i;
 
-        const FILEBAR_H = 18;       // 底部文件名条
-        const RULER_H = 13;         // 波形区下方的时间刻度带
-        const waveTop = y + 26;     // 波形区上沿（留出顶部标题空间）
-        const waveH = cell - 26 - RULER_H - FILEBAR_H - 4;
+        const TOPBAR_H = 16;       // 长条顶部（序号 + 区间秒数）高度
+        const RULER_H = 13;        // 波形区下方的时间刻度带
+        const FILEBAR_H = 14;      // 底部文件名条
+        const waveTop = y + TOPBAR_H;  // 波形区上沿
+        const waveH = rowH - TOPBAR_H - RULER_H - FILEBAR_H;
         const waveX = x + 8;
-        const waveW = cell - 16;
+        const waveW = rowW - 16;
         const rulerY = waveTop + waveH;  // 刻度带顶沿
 
-        // 格子底部：文件名
+        // 长条底部：文件名（左对齐，长条够宽放全名）
         ctx.fillStyle = "rgba(220,230,240,0.85)";
         ctx.font = "11px Arial";
-        ctx.textAlign = "center";
-        ctx.fillText(truncateName(name, 15), x + cell / 2, y + cell - 7);
+        ctx.textAlign = "left";
+        ctx.fillText(truncateName(name, 60), x + 8, y + rowH - 4);
 
         // 波形区底板
         ctx.fillStyle = "rgba(255,255,255,0.05)";
@@ -1470,28 +1499,34 @@ app.registerExtension({
           ctx.textAlign = "center";
           ctx.textBaseline = "middle";
           ctx.fillStyle = isGrabbed ? "#9aa7b3" : "#8fd0ff";
-          ctx.font = `${Math.round(cell * 0.26)}px Arial`;
-          ctx.fillText(playing ? "■" : "♪", x + cell / 2, waveTop + waveH / 2);
+          ctx.font = "16px Arial";
+          ctx.fillText(playing ? "■" : "♪", x + rowW / 2, waveTop + waveH / 2);
           ctx.textBaseline = "alphabetic";
         }
 
-        // 区间秒数（贴波形区上方右侧）
+        // 顶部：序号（左）+ 区间秒数（右）
+        ctx.fillStyle = "rgba(255,255,255,0.55)";
+        ctx.font = "bold 11px Arial";
+        ctx.textAlign = "left";
+        ctx.fillText(String(i + 1), x + 8, y + 11);
         if (dur > 0) {
           const seg =
             tr.e != null
-              ? `${tr.s.toFixed(2)}s → ${tr.e.toFixed(2)}s`
+              ? `${tr.s.toFixed(2)}秒 → ${tr.e.toFixed(2)}秒`
               : tr.s > 0
-                ? `${tr.s.toFixed(2)}s → 结尾`
+                ? `${tr.s.toFixed(2)}秒 → 结尾`
                 : "整段";
           ctx.fillStyle = tr.e != null || tr.s > 0 ? "#8fe08f" : "#7d8894";
           ctx.font = "10px Arial";
           ctx.textAlign = "right";
-          ctx.fillText(seg, x + cell - 8, waveTop - 4);
+          ctx.fillText(seg, x + rowW - 8, y + 11);
+        }
 
-          // ------------------------------------------------------------
-          // 时间刻度（秒）：波形区正下方一排刻度线 + 秒数
-          // 间隔按时长自动选 1/2/5 秒，保证刻度不挤在一起。
-          // ------------------------------------------------------------
+        // ------------------------------------------------------------
+        // 时间刻度（秒）：波形区正下方一排刻度线 + 秒数
+        // 间隔按时长自动选，保证刻度不挤在一起；**单位"秒"强制显示**。
+        // ------------------------------------------------------------
+        if (dur > 0) {
           const stepSec = pickRulerStep(dur, waveW);
           ctx.font = "9px Arial";
           ctx.textAlign = "center";
@@ -1505,29 +1540,24 @@ app.registerExtension({
             ctx.moveTo(px, rulerY + 1);
             ctx.lineTo(px, rulerY + 4);
             ctx.stroke();
-            // 秒数（两端贴着边界，稍微内缩避免溢出格子）
+            // 秒数：一律带「秒」字；末刻度贴右边界内缩，避免溢出长条
             const isEnd = sec + stepSec > dur + 1e-6;
-            const label = isEnd ? `${dur.toFixed(dur < 10 ? 1 : 0)}s` : `${sec}`;
-            const lx = isEnd ? Math.min(px, x + cell - 14) : px;
+            const v = isEnd ? dur : sec;
+            const label = `${formatRulerSec(v)}秒`;
+            const lx = isEnd ? Math.min(px, x + rowW - 16) : px;
             ctx.fillStyle = "rgba(190,205,220,0.85)";
             ctx.fillText(label, lx, rulerY + 8.5);
           }
           ctx.textBaseline = "alphabetic";
         }
 
-        // 序号角标
-        ctx.fillStyle = "rgba(0,0,0,0.7)";
-        ctx.font = "bold 12px Arial";
-        ctx.textAlign = "center";
-        ctx.fillText(String(i + 1), x + 16, y + 18);
-
-        // 删除按钮：拖拽期间隐藏
+        // 删除按钮：放在长条右上角（序号已在左上，不冲突）；拖拽期间隐藏
         if (!drag) {
-          const bx = x + cell - 16;
-          const by = y + 16;
+          const bx = x + rowW - 14;
+          const by = y + 12;
           ctx.fillStyle = "#e04b4b";
           ctx.beginPath();
-          ctx.arc(bx, by, 10, 0, Math.PI * 2);
+          ctx.arc(bx, by, 9, 0, Math.PI * 2);
           ctx.fill();
           ctx.strokeStyle = "#fff";
           ctx.lineWidth = 2;
@@ -1540,32 +1570,35 @@ app.registerExtension({
         }
       }
 
-      // 加号格：固定排在所有音频后面
+      // 添加音频条：固定排在所有音频后面，同样是长条形
       if (count < MAX_AUDIOS) {
-        const ax = cx(count);
+        const ax = cx();
         const ay = cy(count);
         const isHover = this._hoverCell === count;
         ctx.fillStyle = isHover ? "#3a3a3a" : "#2a2a2a";
         ctx.beginPath();
-        ctx.roundRect(ax, ay, cell, cell, 6);
+        ctx.roundRect(ax, ay, rowW, rowH, 6);
         ctx.fill();
         ctx.strokeStyle = isHover ? "#7fbfff" : "#4a4a4a";
         ctx.lineWidth = isHover ? 2 : 1;
         ctx.stroke();
+        // 中间的 + 号
         ctx.strokeStyle = isHover ? "#8fd0ff" : "#666";
         ctx.lineWidth = 3;
-        const c = cell / 2;
-        const r = 22;
+        const cxm = ax + rowW / 2;
+        const cym = ay + rowH / 2;
+        const r = 14;
         ctx.beginPath();
-        ctx.moveTo(ax + c - r, ay + c);
-        ctx.lineTo(ax + c + r, ay + c);
-        ctx.moveTo(ax + c, ay + c - r);
-        ctx.lineTo(ax + c, ay + c + r);
+        ctx.moveTo(cxm - r, cym);
+        ctx.lineTo(cxm + r, cym);
+        ctx.moveTo(cxm, cym - r);
+        ctx.lineTo(cxm, cym + r);
         ctx.stroke();
+        // 文字贴在 + 右侧
         ctx.fillStyle = "#888";
         ctx.font = "12px Arial";
-        ctx.textAlign = "center";
-        ctx.fillText("添加音频", ax + c, ay + c + 44);
+        ctx.textAlign = "left";
+        ctx.fillText("添加音频", cxm + r + 10, cym + 4);
       }
 
       // ---------------------------------------------------------- 底部模式条
@@ -1633,7 +1666,7 @@ app.registerExtension({
      */
     const hitTrim = function (node, pos) {
       if (node._drag) return null;
-      const { cell, gap, cols, startX, startY } = GRID;
+      const { rowH, gap, startX, startY } = GRID;
       const audios = node._audios || [];
       const i = cellAt(node, pos);
       if (i < 0 || i >= audios.length) return null;
@@ -1642,16 +1675,18 @@ app.registerExtension({
       const dur = (node._durations || {})[name] || 0;
       if (!(dur > 0)) return null;
 
-      const x = startX + (i % cols) * (cell + gap);
-      const y = startY + Math.floor(i / cols) * (cell + gap);
-      const FILEBAR_H = 18;
-      const waveTop = y + 26;
-      const waveH = cell - 26 - FILEBAR_H - 4;
+      // 单列长条：水平位置固定，垂直按条号累加
+      const x = startX;
+      const y = startY + i * (rowH + gap);
+      const rowW = rowWidthOf(node);
+      const TOPBAR_H = 16, RULER_H = 13, FILEBAR_H = 14;
+      const waveTop = y + TOPBAR_H;
+      const waveH = rowH - TOPBAR_H - RULER_H - FILEBAR_H;
       // y 必须落在波形区内（含上下的手柄余量）
       if (pos[1] < waveTop - 8 || pos[1] > waveTop + waveH + 8) return null;
 
       const waveX = x + 8;
-      const waveW = cell - 16;
+      const waveW = rowW - 16;
       const tr = trimAt(node, i);
       const sx = waveX + (tr.s / dur) * waveW;
       const ex = tr.e != null ? waveX + (tr.e / dur) * waveW : waveX + waveW;
@@ -1668,25 +1703,25 @@ app.registerExtension({
      * 把横坐标换算成秒（限制在 0~duration）。
      */
     const xToSeconds = function (node, pos, index, dur) {
-      const { cell, gap, cols, startX, startY } = GRID;
-      const x = startX + (index % cols) * (cell + gap);
-      const y = startY + Math.floor(index / cols) * (cell + gap);
-      const waveX = x + 8;
-      const waveW = cell - 16;
+      const { rowH, gap, startX, startY } = GRID;
+      const rowW = rowWidthOf(node);
+      const waveX = startX + 8;
+      const waveW = rowW - 16;
       const ratio = (pos[0] - waveX) / waveW;
       return Math.max(0, Math.min(dur, ratio * dur));
     };
 
-    /** 格子命中判定：音频格 0..n-1，加号格固定是 n */
+    /** 长条命中判定：音频条 0..n-1，添加条固定是 n */
     const cellAt = function (node, pos) {
       if (!withinNode(node, pos)) return -1;
-      const { cell, gap, cols, startX, startY } = GRID;
+      const { rowH, gap, startX, startY } = GRID;
+      const rowW = rowWidthOf(node);
       const n = (node._audios || []).length;
       const total = n < MAX_AUDIOS ? n + 1 : n;
       for (let i = 0; i < total; i++) {
-        const x = startX + (i % cols) * (cell + gap);
-        const y = startY + Math.floor(i / cols) * (cell + gap);
-        if (pos[0] >= x && pos[0] <= x + cell && pos[1] >= y && pos[1] <= y + cell) return i;
+        const x = startX;
+        const y = startY + i * (rowH + gap);
+        if (pos[0] >= x && pos[0] <= x + rowW && pos[1] >= y && pos[1] <= y + rowH) return i;
       }
       return -1;
     };
@@ -1863,17 +1898,18 @@ app.registerExtension({
       if (i === -1) return origDown?.apply(this, arguments);
 
       const audios = this._audios || [];
-      const { cell, gap, cols, startX, startY } = GRID;
-      const x = startX + (i % cols) * (cell + gap);
-      const y = startY + Math.floor(i / cols) * (cell + gap);
+      const { rowH, gap, startX, startY } = GRID;
+      const rowW = rowWidthOf(this);
+      const x = startX;
+      const y = startY + i * (rowH + gap);
 
       if (i < audios.length) {
-        // 右上角删除按钮（优先于一切）
-        const bx = x + cell - 16;
-        const by = y + 16;
+        // 右上角删除按钮（优先于一切）；位置与绘制保持一致
+        const bx = x + rowW - 14;
+        const by = y + 12;
         const dx = pos[0] - bx;
         const dy = pos[1] - by;
-        if (dx * dx + dy * dy < 12 * 12) {
+        if (dx * dx + dy * dy < 10 * 10) {
           const next = audios.slice();
           next.splice(i, 1);
           setAudios(this, next);
