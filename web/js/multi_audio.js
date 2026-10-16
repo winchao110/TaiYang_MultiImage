@@ -530,19 +530,27 @@ function pickRulerStep(dur, _width) {
 /**
  * 刻度**标签**的间隔（秒）。
  *
- * 标记已经密到每秒一条，标签若也每秒都打，长音频会叠成一团糊。
- * 所以标签单独选一个间隔，保证相邻标签至少相距 40px。
+ * 刻度线已经密到每秒一条，标签若也跟着密就会挤成一团。
+ * 规则（按用户要求）：**标签只显示 5秒 / 10秒 / 15秒 …，步长最小 5 秒**，
+ * 且只用 5 的整数倍；只有音频短到放不下 5 秒刻度时才退到 1 / 2 秒。
+ *
  * @param {number} dur 音频总时长（秒）
  * @param {number} width 波形区宽度（px）
  */
 function pickLabelStep(dur, width) {
-  if (!(dur > 0) || !(width > 0)) return 1;
-  const MIN_PX = 40;
-  const cands = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
-  for (const c of cands) {
+  if (!(dur > 0) || !(width > 0)) return 5;
+  const MIN_PX = 44; // 8px 字号下，44px 才放得下「120秒」这类标签不贴边
+  // 5 的整数倍，从小到大
+  const mult5 = [5, 10, 15, 30, 60, 120, 300, 600];
+  for (const c of mult5) {
+    if (c > dur) break; // 超过音频时长了，改用更细的
     if ((c / dur) * width >= MIN_PX) return c;
   }
-  return cands[cands.length - 1];
+  // 音频不足 5 秒：退到 2 秒 / 1 秒（短音频标签本来就不多）
+  for (const c of [2, 1]) {
+    if ((c / dur) * width >= MIN_PX) return c;
+  }
+  return 1;
 }
 
 /** 正在试听的 {name, index, start, end, el, timer} */
@@ -1538,35 +1546,37 @@ app.registerExtension({
 
         // ------------------------------------------------------------
         // 时间刻度（秒）
-        //   - 刻度**标记**：间隔 ≤1 秒，保证「精确到 1 秒」（短音频更细）
-        //   - 刻度**标签**：按可读性抽稀（至少相距 40px），否则长音频会叠成一团
-        //   - 单位「秒」强制显示
+        //   - 刻度**线**：间隔 ≤1 秒，精确到 1 秒（短音频更细）
+        //   - 刻度**标签**：只显示 5秒/10秒/15秒…（步长最小 5 秒，仅 5 的整数倍），
+        //     音频不足 5 秒才退到 1/2 秒 —— 这样每秒都有刻度线但不挤
+        //   - 单位「秒」强制显示；字号调小，进一步降低拥挤感
         // ------------------------------------------------------------
         if (dur > 0) {
-          const tickStep = pickRulerStep(dur, waveW);   // 标记间隔（≤1秒）
-          const labelStep = pickLabelStep(dur, waveW);  // 标签间隔（可读性）
+          const tickStep = pickRulerStep(dur, waveW);   // 刻度线间隔（≤1秒）
+          const labelStep = pickLabelStep(dur, waveW);  // 标签间隔（最小5秒）
           const ticks = Math.floor(dur / tickStep + 1e-6);
-          // 标签抽稀比例：每隔 labelEvery 个标记打一个标签
+          // 标签抽稀比例：每隔 labelEvery 条刻度线打一个标签
           const labelEvery = Math.max(1, Math.round(labelStep / tickStep));
 
+          ctx.font = "8px Arial";       // 字小一点
           ctx.textAlign = "center";
           ctx.textBaseline = "middle";
 
           const drawTick = (sec, labeled, isEnd, skipLine = false) => {
             const px = waveX + (sec / dur) * waveW;
-            // 刻度线：带标签的画长一些，形成主次层次
+            // 刻度线：带标签的长一些深一些，没标签的短而淡 —— 主次分明不拥挤
             if (!skipLine) {
-              ctx.strokeStyle = labeled ? "rgba(160,185,210,0.85)" : "rgba(120,140,160,0.45)";
+              ctx.strokeStyle = labeled ? "rgba(165,190,215,0.9)" : "rgba(115,135,155,0.35)";
               ctx.lineWidth = 1;
               ctx.beginPath();
               ctx.moveTo(px, rulerY + 1);
-              ctx.lineTo(px, rulerY + (labeled ? 5 : 3));
+              ctx.lineTo(px, rulerY + (labeled ? 5 : 2.5));
               ctx.stroke();
             }
             if (!labeled) return;
             // 标签：一律带「秒」；末刻度贴右边界内缩，避免溢出长条
-            const lx = isEnd ? Math.min(px, x + rowW - 18) : px;
-            ctx.fillStyle = "rgba(200,215,230,0.95)";
+            const lx = isEnd ? Math.min(px, x + rowW - 16) : px;
+            ctx.fillStyle = "rgba(205,220,235,0.95)";
             ctx.fillText(`${formatRulerSec(sec)}秒`, lx, rulerY + 9);
           };
 
