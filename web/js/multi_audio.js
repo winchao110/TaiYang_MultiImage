@@ -522,6 +522,37 @@ function getAudioBuffer(node, name) {
 }
 
 /**
+ * **按秒裁切** AudioBuffer，返回只含 [start, end) 这一段的新 buffer。
+ *
+ * 试听走这条路而不是 `source.start(0, offset, duration)`：
+ * 用户要求「按照当前显示的开始和结束时间来剪裁，然后播放」——
+ * 真正裁一段出来、从 0 播，语义最直白，也不依赖各浏览器对 offset 的处理差异。
+ * 上传（后端）用的是同一对秒值，两边必然一致。
+ *
+ * @param {AudioContext} ctx
+ * @param {AudioBuffer} src 原音频
+ * @param {number} start 起始秒
+ * @param {number} end 结束秒
+ * @returns {AudioBuffer|null} start>=end 或越界时返回 null
+ */
+function cutBuffer(ctx, src, start, end) {
+  const sr = src.sampleRate;
+  const total = src.length;
+  let i0 = Math.round(start * sr);
+  let i1 = end == null ? total : Math.round(end * sr);
+  // 夹到合法范围，并保证至少 1 个采样点
+  i0 = Math.max(0, Math.min(total - 1, i0));
+  i1 = Math.max(i0 + 1, Math.min(total, i1));
+  const len = i1 - i0;
+  if (!(len > 0)) return null;
+  const out = ctx.createBuffer(src.numberOfChannels, len, sr);
+  for (let c = 0; c < src.numberOfChannels; c++) {
+    out.getChannelData(c).set(src.getChannelData(c).subarray(i0, i1));
+  }
+  return out;
+}
+
+/**
  * 从 AudioBuffer 提取波形峰值（用于绘制），按 outW 列聚合。
  * 返回 Float32Array(outW)，值域 0~1。
  */
@@ -607,19 +638,18 @@ let previewing = null;
 
 
 /**
- * 试听：从 start 播到 end。
+ * 试听：**按当前显示的开始/结束秒数裁切音频，然后播放裁出来的那段**。
  * 已在试听同一条-> 停止；试听别的 -> 先停旧的再播新的。
  *
- * **用 Web Audio 而不是 HTMLAudioElement.seek**：
- * 浏览器对无 Xing 头的 CBR MP3 只能按码率估算位置，seek 可能差好几秒
- * （表现为「比竖线早了 1.5 秒」这种整段偏移）。
- * 解码成 AudioBuffer 后用 `source.start(0, offset, duration)` 可以
- * **按采样点**指定起播与时长，起点/终点都精确落在竖线上。
+ * 做法（按用户要求改）：不用 `source.start(0, offset, duration)` 直接定位，
+ * 而是 `cutBuffer()` 真裁一段 [start, end) 出来，再从 0 播。
+ * 语义最直白，也不依赖浏览器对 offset 的处理差异。
+ * 上传（后端 torchaudio）用的是同一对秒值，试听与上传必然一致。
  *
- * 流程：取/解码 buffer -> start(offset=起点, duration=终点-起点) -> 轮询播放头。
  * @returns {boolean} 是否成功开始试听
  */
 function togglePreview(node, index, name) {
+  // 每次点击都**重新读当前显示的区间**，不用任何缓存值
   const t = trimAt(node, index);
   if (previewing && previewing.name === name && previewing.index === index) {
     stopPreview();
@@ -641,31 +671,45 @@ function togglePreview(node, index, name) {
 
   getAudioBuffer(node, name).then((info) => {
     if (previewing !== entry || !info) return;      // 已被停止 / 解码失败
-    const { buffer } = info;
-    entry.buffer = buffer;
-    // 区间终点用解码后的真实时长夹一次：若竖线是按旧的估算时长画的，
-    // 终点可能超出真实音频长度，这里夹住避免播放空段。
-    if (entry.end > buffer.duration) entry.end = buffer.duration;
-    if (!(entry.end > entry.start)) {
+    const full = info.buffer;
+    // 终点夹到真实音频长度内，避免裁出空段
+    const endClamped = Math.min(entry.end, full.duration);
+    if (!(endClamped > entry.start)) {
       stopPreview();
       return;
     }
+    entry.end = endClamped;
+
+    // **真正裁一段出来**，然后从 0 播放
+    const cut = cutBuffer(ctx, full, entry.start, entry.end);
+    if (!cut) {
+      stopPreview();
+      return;
+    }
+    entry.buffer = cut;                 // 记住裁好的段，供 seekPreview 用
+    entry.fullBuffer = full;            // 原音频，拖动竖线时重新裁
+    entry.cutStart = entry.start;       // 裁切起点（秒）
+    entry.cutEnd = entry.end;           // 裁切终点（秒）
+
     const src = ctx.createBufferSource();
-    src.buffer = buffer;
+    src.buffer = cut;
     src.connect(ctx.destination);
     entry.src = src;
     entry.mode = "webaudio";
-    // 采样级精确：从 startSec 起，播 (entry.end-startSec) 秒。
-    // 注意用 entry.end（已按真实时长夹过），不要用局部 endSec。
-    const playDur = Math.max(0.001, entry.end - startSec);
     entry.t0 = ctx.currentTime;
-    src.start(0, Math.min(startSec, buffer.duration), playDur);
+    src.start(0);                        // 从裁段的 0 开始播
     src.onended = () => {
       if (previewing === entry) stopPreview();
     };
     node._playing = name;
     node._playingIndex = index;
     node.setDirtyCanvas?.(true, true);
+    // 便于核对：试听用的秒数 / 原音频真实时长
+    console.debug(
+      `[TaiYangMultiAudio] 试听 #${index + 1} ${name}: ` +
+        `裁切 ${entry.start.toFixed(3)}s → ${entry.end.toFixed(3)}s ` +
+        `(${(entry.end - entry.start).toFixed(3)}s)，原音频 ${full.duration.toFixed(3)}s`
+    );
   });
 
   return true;
@@ -679,14 +723,15 @@ function previewPosition() {
 }
 
 /**
- * 拖动竖线时把播放头挪到新位置（不打断播放）。
- * Web Audio 没有「seek」概念，只能停掉当前 source 再按新 offset 起一个，
- * 听感上仍是连续的。
+ * 拖动起点竖线时，按新的开始秒**重新裁一段**再播（不打断听感）。
+ * 与 togglePreview 用同一套裁切逻辑，保证行为一致。
  */
 function seekPreview(newStart) {
   if (!previewing || previewing.mode !== "webaudio" || !_audioCtx) return;
   const e = previewing;
   const ctx = _audioCtx;
+  const full = e.fullBuffer;
+  if (!full) return;
   try {
     e.src?.stop?.();
     e.src?.disconnect?.();
@@ -694,16 +739,19 @@ function seekPreview(newStart) {
     /* 忽略 */
   }
   e.start = newStart;
-  const buf = e.buffer;
-  if (!buf) return;
-  const endSec = e.end ?? buf.duration;
+  e.cutStart = newStart;
+  const endSec = e.end ?? full.duration;
   if (!(endSec > newStart)) return;
+  // 用原音频重新裁 [newStart, end)
+  const cut = cutBuffer(ctx, full, newStart, endSec);
+  if (!cut) return;
+  e.buffer = cut;
   const src = ctx.createBufferSource();
-  src.buffer = buf;
+  src.buffer = cut;
   src.connect(ctx.destination);
   e.src = src;
   e.t0 = ctx.currentTime;
-  src.start(0, Math.min(newStart, buf.duration), Math.max(0.001, endSec - newStart));
+  src.start(0);                       // 裁段从 0 播
   src.onended = () => {
     if (previewing === e) stopPreview();
   };
