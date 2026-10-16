@@ -226,8 +226,11 @@ function syncOutputSlots(node, count) {
  */
 function setAudios(node, files) {
   const list = files.slice(0, MAX_AUDIOS);
-  // 记下旧列表，供 pruneTrims 做区间重对齐（排序时区间要跟着文件走）
-  node._prevAudios = (node._audios || []).slice();
+  const oldNames = (node._audios || []).slice();
+  // **必须在改 _audios 之前读旧区间**：readTrims 按 _audios.length 截断，
+  // 等列表改了再读，被删文件后面的区间会被挤掉/错位。
+  const oldTrims = readTrims(node);
+  node._prevAudios = oldNames;
   const w = getWidget(node, "audio_files");
   if (w) w.value = JSON.stringify(list);
   node._audios = list.slice();
@@ -237,7 +240,7 @@ function setAudios(node, files) {
   if (node.size && node.size[1] < minH) node.size[1] = minH;
   if (node.size && node.size[0] < MIN_NODE_W) node.size[0] = MIN_NODE_W;
   // 音频列表变了：按新顺序重新对齐裁剪区间（同名音频也各自独立）
-  pruneTrims(node);
+  pruneTrims(node, oldNames, oldTrims);
   // **预取音频数据**：新上传的音频必须有时长才会画裁剪竖线与时间刻度。
   // 只走解码（getAudioBuffer）——**不要先读 metadata**：
   // HTMLAudioElement.duration 对 MP3 只是按码率估算，可能差好几秒。
@@ -378,12 +381,13 @@ function realignTrims(oldNames, newNames, oldTrims) {
 }
 
 /** 音频列表变化后，按新顺序重新对齐裁剪区间（见 realignTrims） */
-function pruneTrims(node) {
+function pruneTrims(node, oldNamesArg, oldTrimsArg) {
   const w = getWidget(node, "trims");
   if (!w) return;
-  const oldNames = node._prevAudios || [];
+  const oldNames = oldNamesArg ?? node._prevAudios ?? [];
   const newNames = node._audios || [];
-  const oldTrims = readTrims(node);
+  // 旧区间由调用方在改列表**之前**传入；没传则现读（此时已按新长度截断）
+  const oldTrims = oldTrimsArg ?? readTrims(node);
   writeTrims(node, realignTrims(oldNames, newNames, oldTrims));
 }
 
@@ -403,6 +407,19 @@ function durOf(node, name) {
   if (b && typeof b.duration === "number" && b.duration > 0) return b.duration;
   const d = node?._durations?.[name];
   return typeof d === "number" && d > 0 ? d : 0;
+}
+
+/**
+ * 取**已解码确认**的精确时长；没解码成功返回 0。
+ *
+ * 竖线定位、命中判定、拖动换算**只认这个值**——
+ * 试听是按解码后的采样点播的，若竖线用 metadata 估算值（MP3 可能差数秒），
+ * 就会出现「竖线越往后，跟试听差得越多」的比例误差。
+ * 这里从构造上保证：能拖竖线 <=> 已解码 <=> 试听必然用同一份时长。
+ */
+function exactDurOf(node, name) {
+  const b = node?._bufs?.[name];
+  return b && typeof b.duration === "number" && b.duration > 0 ? b.duration : 0;
 }
 
 /**
@@ -638,8 +655,9 @@ function togglePreview(node, index, name) {
     src.connect(ctx.destination);
     entry.src = src;
     entry.mode = "webaudio";
-    // 采样级精确：从 startSec 起，播 (endSec-startSec) 秒
-    const playDur = Math.max(0.001, endSec - startSec);
+    // 采样级精确：从 startSec 起，播 (entry.end-startSec) 秒。
+    // 注意用 entry.end（已按真实时长夹过），不要用局部 endSec。
+    const playDur = Math.max(0.001, entry.end - startSec);
     entry.t0 = ctx.currentTime;
     src.start(0, Math.min(startSec, buffer.duration), playDur);
     src.onended = () => {
@@ -1451,7 +1469,7 @@ app.registerExtension({
         // ------------------------------------------------------------------
         const name = audios[i];
         const tr = trimAt(this, i);
-        const dur = durOf(this, name);
+        const dur = exactDurOf(this, name);   // 竖线只认解码后的精确时长
         const playing = this._playingIndex === i;
 
         const TOPBAR_H = 16;       // 长条顶部（序号 + 区间秒数）高度
@@ -1553,19 +1571,28 @@ app.registerExtension({
             }
           }
         } else {
-          // 时长未知：画音符占位，并提示点击可试听
+          // 还没解码出精确时长：明确提示，而不是画一条位置可能不对的竖线。
+          // （解码完成后会自动重绘，竖线才出现）
           ctx.textAlign = "center";
           ctx.textBaseline = "middle";
-          ctx.fillStyle = isGrabbed ? "#9aa7b3" : "#8fd0ff";
-          ctx.font = "16px Arial";
-          ctx.fillText(playing ? "■" : "♪", x + rowW / 2, waveTop + waveH / 2);
+          ctx.fillStyle = "rgba(150,170,190,0.75)";
+          ctx.font = "11px Arial";
+          ctx.fillText("读取中…", x + rowW / 2, waveTop + waveH / 2);
           ctx.textBaseline = "alphabetic";
         }
 
-        // 顶部：序号（左）+ 区间秒数（右）
+        // 顶部：序号（左）+ 总时长（中）+ 区间秒数（右）
+        // 总时长直接显示出来，方便和实际音频核对（竖线与试听都以它为准）
         ctx.fillStyle = "rgba(255,255,255,0.55)";
         ctx.font = "bold 11px Arial";
         ctx.textAlign = "left";
+        ctx.fillText(String(i + 1), x + 8, y + 11);
+        if (dur > 0) {
+          ctx.fillStyle = "rgba(160,185,210,0.9)";
+          ctx.font = "10px Arial";
+          ctx.textAlign = "center";
+          ctx.fillText(`${formatRulerSec(dur)}秒`, x + rowW / 2, y + 11);
+        }
         ctx.fillText(String(i + 1), x + 8, y + 11);
         if (dur > 0) {
           const seg =
@@ -1750,7 +1777,7 @@ app.registerExtension({
       if (i < 0 || i >= audios.length) return null;
 
       const name = audios[i];
-      const dur = durOf(node, name);
+      const dur = exactDurOf(node, name);
       if (!(dur > 0)) return null;
 
       // 单列长条：水平位置固定，垂直按条号累加
