@@ -1550,8 +1550,11 @@ app.registerExtension({
           ctx.strokeStyle = "rgba(150,200,240,0.85)";
           ctx.lineWidth = 1;
           ctx.beginPath();
-          for (let i = 0; i < peaks.length; i++) {
-            const px = waveX + (i / Math.max(1, peaks.length - 1)) * waveW;
+          // 第 i 列代表时间 [i/n, (i+1)/n)，所以像素要用 **i/n** 而不是 i/(n-1)。
+          // 用 n-1 会让整条波形被拉伸 1/(n-1) 倍，与竖线的秒标尺对不上。
+          const nCols = peaks.length;
+          for (let i = 0; i < nCols; i++) {
+            const px = waveX + (i / Math.max(1, nCols)) * waveW;
             const h = Math.max(0.5, peaks[i] * half);
             ctx.moveTo(px, mid - h);
             ctx.lineTo(px, mid + h);
@@ -1610,8 +1613,13 @@ app.registerExtension({
           if (playing && previewing) {
             const t = previewPosition();
             if (t != null) {
+              // 播放头在 [起点线, 终点线] 之间线性映射。
+              // **必须从 sx 起算，不能从 waveX 起算**：
+              // 若从 waveX（波形区左边缘）起算，播放头会被整体左移
+              // (sx - waveX) 像素——正好等于起点线到左边缘的距离，
+              // 于是「起点竖线越往后，播放头偏得越多」。
               const span = Math.max(0.001, (tr.e ?? dur) - tr.s);
-              const px = waveX + ((t - tr.s) / span) * (ex - sx);
+              const px = sx + ((t - tr.s) / span) * (ex - sx);
               if (px >= sx && px <= ex) {
                 ctx.fillStyle = "#ffd479";
                 ctx.fillRect(px - 1, waveTop, 2, waveH);
@@ -1630,7 +1638,7 @@ app.registerExtension({
         }
 
         // 顶部：序号（左）+ 总时长（中）+ 区间秒数（右）
-        // 总时长直接显示出来，方便和实际音频核对（竖线与试听都以它为准）
+        // 总时长与播放中的当前位置都显示出来，方便和实际音频核对
         ctx.fillStyle = "rgba(255,255,255,0.55)";
         ctx.font = "bold 11px Arial";
         ctx.textAlign = "left";
@@ -1639,10 +1647,19 @@ app.registerExtension({
           ctx.fillStyle = "rgba(160,185,210,0.9)";
           ctx.font = "10px Arial";
           ctx.textAlign = "center";
-          ctx.fillText(`${formatRulerSec(dur)}秒`, x + rowW / 2, y + 11);
-        }
-        ctx.fillText(String(i + 1), x + 8, y + 11);
-        if (dur > 0) {
+          // 试听中：把「当前播放到第几秒」显示在总时长旁边，一眼核对
+          if (playing && previewing) {
+            const cur = previewPosition();
+            if (cur != null) {
+              ctx.fillStyle = "#ffd479";
+              ctx.font = "bold 10px Arial";
+              ctx.fillText(`▶ ${formatRulerSec(cur)}秒`, x + rowW / 2, y + 11);
+            } else {
+              ctx.fillText(`${formatRulerSec(dur)}秒`, x + rowW / 2, y + 11);
+            }
+          } else {
+            ctx.fillText(`${formatRulerSec(dur)}秒`, x + rowW / 2, y + 11);
+          }
           const seg =
             tr.e != null
               ? `${tr.s.toFixed(2)}秒 → ${tr.e.toFixed(2)}秒`
