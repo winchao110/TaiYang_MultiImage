@@ -239,10 +239,12 @@ function setAudios(node, files) {
   // 音频列表变了：按新顺序重新对齐裁剪区间（同名音频也各自独立）
   pruneTrims(node);
   // **预取音频数据**：新上传的音频必须有时长才会画裁剪竖线与时间刻度。
-  // 同时解码 buffer（供精确试听 + 画真实波形）。
-  // （以前只在 onNodeCreated/onConfigure 里取，上传的音频一直没取到 → 不显示竖线）
+  // 只走解码（getAudioBuffer）——**不要先读 metadata**：
+  // HTMLAudioElement.duration 对 MP3 只是按码率估算，可能差好几秒。
+  // 若让估算值先占位，竖线会先画在错位置，解码完成后又跳一下；
+  // 更糟的是缓存命中不回填时，估算值会一直留着，导致竖线和试听长期对不上。
+  // 解码失败时 getAudioBuffer 内部会自己退回 metadata 兜底。
   (list || []).forEach((n) => {
-    getDuration(node, n);
     getAudioBuffer(node, n);
   });
   node.setDirtyCanvas(true, true);
@@ -388,7 +390,24 @@ function pruneTrims(node) {
 // ---------------------------------------------------------------- 时长 / 试听
 
 /**
+ * 取音频时长（用于竖线定位、刻度、命中判定）。
+ *
+ * **必须优先用解码后的精确时长**：HTMLAudioElement.duration 对 MP3 只是按码率
+ * 估算，可能差好几秒；而试听是按采样点播的。若竖线用估算值、试听用真实值，
+ * 两者就会对不上（用户反馈「比竖线差约 2 秒」正是这个原因）。
+ *
+ * 只有解码失败时才退到 metadata 估算值（聊胜于无）。
+ */
+function durOf(node, name) {
+  const b = node?._bufs?.[name];
+  if (b && typeof b.duration === "number" && b.duration > 0) return b.duration;
+  const d = node?._durations?.[name];
+  return typeof d === "number" && d > 0 ? d : 0;
+}
+
+/**
  * 取音频时长（秒）。用 HTMLAudioElement 读 metadata，不解码整段，开销小。
+ * **仅作为解码失败时的兜底**，正常路径一律用 durOf() 拿解码后的精确时长。
  * 结果缓存在 node._durations[name]，避免重复加载。
  */
 function getDuration(node, name) {
@@ -450,9 +469,20 @@ function ensureAudioCtx() {
  */
 function getAudioBuffer(node, name) {
   const cache = (node._bufs ||= {});
-  if (cache[name] != null) return Promise.resolve(cache[name]);
+  if (cache[name] != null) {
+    // 缓存命中也要回填精确时长：onConfigure 会重置 _durations，
+    // 不回填就会退回到 metadata 估算值，导致竖线和试听对不上。
+    if (cache[name]?.duration && node._durations) {
+      node._durations[name] = cache[name].duration;
+    }
+    return Promise.resolve(cache[name]);
+  }
   const ctx = ensureAudioCtx();
-  if (!ctx) return Promise.resolve(null);
+  if (!ctx) {
+    // 没有 Web Audio（老浏览器）：退回 metadata 估算
+    getDuration(node, name);
+    return Promise.resolve(null);
+  }
   return fetch(audioUrl(name))
     .then((r) => {
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
@@ -468,6 +498,8 @@ function getAudioBuffer(node, name) {
     })
     .catch(() => {
       cache[name] = null;   // 记失败，避免反复重试
+      // 解码失败：退回 metadata 估算，至少能把竖线和刻度画出来
+      getDuration(node, name);
       return null;
     });
 }
@@ -578,7 +610,7 @@ function togglePreview(node, index, name) {
   }
   stopPreview();
 
-  const dur = (node._durations || {})[name] || t.e || 0;
+  const dur = durOf(node, name) || t.e || 0;
   const startSec = Math.max(0, t.s);
   const endSec = t.e != null ? t.e : dur;
   if (!(endSec > startSec)) return false;   // 区间非法，不播
@@ -594,9 +626,12 @@ function togglePreview(node, index, name) {
     if (previewing !== entry || !info) return;      // 已被停止 / 解码失败
     const { buffer } = info;
     entry.buffer = buffer;
-    // 用解码后的真实时长兜底：metadata 估算可能不准
-    if (entry.end == null || entry.end > buffer.duration) {
-      entry.end = buffer.duration;
+    // 区间终点用解码后的真实时长夹一次：若竖线是按旧的估算时长画的，
+    // 终点可能超出真实音频长度，这里夹住避免播放空段。
+    if (entry.end > buffer.duration) entry.end = buffer.duration;
+    if (!(entry.end > entry.start)) {
+      stopPreview();
+      return;
     }
     const src = ctx.createBufferSource();
     src.buffer = buffer;
@@ -1120,8 +1155,9 @@ app.registerExtension({
         modeWidget.draw = () => {};
       }
 
-      // 异步读取每条音频的时长（画竖线要用）
-      (this._audios || []).forEach((n) => getDuration(this, n));
+      // 异步解码每条音频（拿精确时长画竖线 + 供试听/波形）。
+      // 只走解码，不先读 metadata —— metadata 对 MP3 只是估算，会让竖线和试听对不上。
+      (this._audios || []).forEach((n) => getAudioBuffer(this, n));
 
       return r;
     };
@@ -1146,8 +1182,8 @@ app.registerExtension({
         if (tw) tw.value = this.properties.trims;
       }
       this._durations = {};
-      // 读时长，画竖线要用
-      (this._audios || []).forEach((n) => getDuration(this, n));
+      // 读精确时长（解码），画竖线要用；不先读 metadata（估算不准）
+      (this._audios || []).forEach((n) => getAudioBuffer(this, n));
 
       const linkedCount = (this.outputs || []).filter((o) => (o.links || []).length > 0).length;
       syncOutputSlots(this, Math.max(this._audios.length, linkedCount));
@@ -1415,7 +1451,7 @@ app.registerExtension({
         // ------------------------------------------------------------------
         const name = audios[i];
         const tr = trimAt(this, i);
-        const dur = (this._durations || {})[name] || 0;
+        const dur = durOf(this, name);
         const playing = this._playingIndex === i;
 
         const TOPBAR_H = 16;       // 长条顶部（序号 + 区间秒数）高度
@@ -1714,7 +1750,7 @@ app.registerExtension({
       if (i < 0 || i >= audios.length) return null;
 
       const name = audios[i];
-      const dur = (node._durations || {})[name] || 0;
+      const dur = durOf(node, name);
       if (!(dur > 0)) return null;
 
       // 单列长条：水平位置固定，垂直按条号累加
