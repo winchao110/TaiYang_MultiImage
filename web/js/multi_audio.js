@@ -508,27 +508,41 @@ function formatRulerSec(v) {
 }
 
 /**
- * 选时间刻度的间隔（秒）。
- * 目标：相邻刻度至少相距 34px，且刻度总数不超过 8 个——
- * 格子只有一百多像素宽，刻度太多会糊成一片（3秒音频按 1 秒一格会有 4 个，
- * 但 30 秒若按 1 秒一格就是 31 个，必须往上跳）。
- * 只在 1/2/5/10/15/30/60 这些「人类友好」的整数里挑，不出现 0.37 这种。
+ * 刻度**标记**的间隔（秒）。
+ *
+ * 硬性要求：**必须精确到 1 秒**，即间隔 ≤ 1 秒，每秒都有刻度线。
+ * 只有短于 1 秒的音频才用更细的 0.1 / 0.2 / 0.5 秒。
+ * @param {number} dur 音频总时长（秒）
+ * @param {number} _width 波形区宽度（保留参数，标记间隔不依赖宽度）
+ */
+function pickRulerStep(dur, _width) {
+  if (!(dur > 0)) return 1;
+  if (dur < 1) {
+    // 短音频：选一个不超过时长、且能分出至少 4 格的细间隔
+    for (const c of [0.5, 0.2, 0.1]) {
+      if (c <= dur) return c;
+    }
+    return 0.1;
+  }
+  return 1; // 精确到 1 秒
+}
+
+/**
+ * 刻度**标签**的间隔（秒）。
+ *
+ * 标记已经密到每秒一条，标签若也每秒都打，长音频会叠成一团糊。
+ * 所以标签单独选一个间隔，保证相邻标签至少相距 40px。
  * @param {number} dur 音频总时长（秒）
  * @param {number} width 波形区宽度（px）
  */
-function pickRulerStep(dur, width) {
+function pickLabelStep(dur, width) {
   if (!(dur > 0) || !(width > 0)) return 1;
-  const MIN_PX = 34;
-  const MAX_TICKS = 8;
-  const candidates = [0.1, 0.2, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
-  for (const c of candidates) {
-    if ((c / dur) * width >= MIN_PX && dur / c <= MAX_TICKS) return c;
+  const MIN_PX = 40;
+  const cands = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600];
+  for (const c of cands) {
+    if ((c / dur) * width >= MIN_PX) return c;
   }
-  // 候选都太密 -> 取能落在 MAX_TICKS 以内的最大间隔
-  for (const c of candidates) {
-    if (dur / c <= MAX_TICKS) return c;
-  }
-  return candidates[candidates.length - 1];
+  return cands[cands.length - 1];
 }
 
 /** 正在试听的 {name, index, start, end, el, timer} */
@@ -1523,31 +1537,49 @@ app.registerExtension({
         }
 
         // ------------------------------------------------------------
-        // 时间刻度（秒）：波形区正下方一排刻度线 + 秒数
-        // 间隔按时长自动选，保证刻度不挤在一起；**单位"秒"强制显示**。
+        // 时间刻度（秒）
+        //   - 刻度**标记**：间隔 ≤1 秒，保证「精确到 1 秒」（短音频更细）
+        //   - 刻度**标签**：按可读性抽稀（至少相距 40px），否则长音频会叠成一团
+        //   - 单位「秒」强制显示
         // ------------------------------------------------------------
         if (dur > 0) {
-          const stepSec = pickRulerStep(dur, waveW);
-          ctx.font = "9px Arial";
+          const tickStep = pickRulerStep(dur, waveW);   // 标记间隔（≤1秒）
+          const labelStep = pickLabelStep(dur, waveW);  // 标签间隔（可读性）
+          const ticks = Math.floor(dur / tickStep + 1e-6);
+          // 标签抽稀比例：每隔 labelEvery 个标记打一个标签
+          const labelEvery = Math.max(1, Math.round(labelStep / tickStep));
+
           ctx.textAlign = "center";
           ctx.textBaseline = "middle";
-          for (let sec = 0; sec <= dur + 1e-6; sec += stepSec) {
+
+          const drawTick = (sec, labeled, isEnd, skipLine = false) => {
             const px = waveX + (sec / dur) * waveW;
-            // 刻度线
-            ctx.strokeStyle = "rgba(140,160,180,0.5)";
-            ctx.lineWidth = 1;
-            ctx.beginPath();
-            ctx.moveTo(px, rulerY + 1);
-            ctx.lineTo(px, rulerY + 4);
-            ctx.stroke();
-            // 秒数：一律带「秒」字；末刻度贴右边界内缩，避免溢出长条
-            const isEnd = sec + stepSec > dur + 1e-6;
-            const v = isEnd ? dur : sec;
-            const label = `${formatRulerSec(v)}秒`;
-            const lx = isEnd ? Math.min(px, x + rowW - 16) : px;
-            ctx.fillStyle = "rgba(190,205,220,0.85)";
-            ctx.fillText(label, lx, rulerY + 8.5);
+            // 刻度线：带标签的画长一些，形成主次层次
+            if (!skipLine) {
+              ctx.strokeStyle = labeled ? "rgba(160,185,210,0.85)" : "rgba(120,140,160,0.45)";
+              ctx.lineWidth = 1;
+              ctx.beginPath();
+              ctx.moveTo(px, rulerY + 1);
+              ctx.lineTo(px, rulerY + (labeled ? 5 : 3));
+              ctx.stroke();
+            }
+            if (!labeled) return;
+            // 标签：一律带「秒」；末刻度贴右边界内缩，避免溢出长条
+            const lx = isEnd ? Math.min(px, x + rowW - 18) : px;
+            ctx.fillStyle = "rgba(200,215,230,0.95)";
+            ctx.fillText(`${formatRulerSec(sec)}秒`, lx, rulerY + 9);
+          };
+
+          // 先画 0 ~ ticks-1 的整秒（或整档）刻度
+          for (let k = 0; k < ticks; k++) {
+            const sec = k * tickStep;
+            drawTick(sec, k % labelEvery === 0, false);
           }
+          // 末尾统一画「音频真实时长」这个刻度（带标签），保证终点精确。
+          // 若终点和上一个刻度几乎重合（<1px）就不重复画线，只保留标签位置正确。
+          const lastPx = ticks > 0 ? waveX + ((ticks * tickStep) / dur) * waveW : -1;
+          const endPx = waveX + waveW;
+          drawTick(dur, true, true, Math.abs(endPx - lastPx) < 1);
           ctx.textBaseline = "alphabetic";
         }
 
