@@ -61,6 +61,15 @@ const rowX = () => START_X;
 /** 第 i 条的垂直起点（从上往下累加） */
 const rowY = (i) => HEADER_H + i * (ROW_H + ROW_GAP);
 
+/**
+ * 参考音频过长阈值（秒）。
+ * MiniMax H3 的 length 训练范围约 124~362 帧（≈5.2~15.1 秒），
+ * 参考音频若远长于生成时长，音频潜变量会比输出长好几倍，
+ * 音色特征被稀释——表现为「感觉没参考这个音色」。
+ * 超过此值在节点里用橙色 ⚠ 标出，提醒裁一段纯人声。
+ */
+const LONG_REF_AUDIO_SEC = 15;
+
 // ---------------------------------------------------------------- 拖拽排序（纯逻辑）
 // 统一模型：order[p] = 位置 p 上放的是原来第几个音频。绘制与落盘都基于这一个数组。
 
@@ -1644,21 +1653,28 @@ app.registerExtension({
         ctx.textAlign = "left";
         ctx.fillText(String(i + 1), x + 8, y + 11);
         if (dur > 0) {
-          ctx.fillStyle = "rgba(160,185,210,0.9)";
-          ctx.font = "10px Arial";
-          ctx.textAlign = "center";
           // 试听中：把「当前播放到第几秒」显示在总时长旁边，一眼核对
           if (playing && previewing) {
             const cur = previewPosition();
             if (cur != null) {
               ctx.fillStyle = "#ffd479";
               ctx.font = "bold 10px Arial";
+              ctx.textAlign = "center";
               ctx.fillText(`▶ ${formatRulerSec(cur)}秒`, x + rowW / 2, y + 11);
-            } else {
-              ctx.fillText(`${formatRulerSec(dur)}秒`, x + rowW / 2, y + 11);
             }
-          } else {
-            ctx.fillText(`${formatRulerSec(dur)}秒`, x + rowW / 2, y + 11);
+          }
+          if (!(playing && previewing && previewPosition() != null)) {
+            // 参考音频过长会稀释音色参考（MiniMax H3 训练范围约 5~15 秒），
+            // 超过 15 秒用橙色标出，提醒用户裁一段纯人声。
+            const tooLong = dur > LONG_REF_AUDIO_SEC;
+            ctx.fillStyle = tooLong ? "#ff9d5c" : "rgba(160,185,210,0.9)";
+            ctx.font = tooLong ? "bold 10px Arial" : "10px Arial";
+            ctx.textAlign = "center";
+            ctx.fillText(
+              tooLong ? `${formatRulerSec(dur)}秒 ⚠` : `${formatRulerSec(dur)}秒`,
+              x + rowW / 2,
+              y + 11
+            );
           }
           const seg =
             tr.e != null
