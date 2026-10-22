@@ -1,6 +1,7 @@
 import json
 import math
 import os
+import uuid
 
 import folder_paths
 import numpy as np
@@ -28,7 +29,10 @@ class TaiYangMultiImageLoader:
         return {
             "required": {
                 "image_files": ("STRING", {"default": "[]", "multiline": False}),
-                "auto_link": (["自动", "TextEncodeQwenImage21", "TextEncodeQwenImageEditPlus", "关闭"], {"default": "自动"}),
+                # 选项必须与前端 MODE_OPTIONS 一一对应（multi_image.js），
+                # 少一项会让面板里选到的目标提交时校验失败
+                "auto_link": (["自动", "TextEncodeQwenImage21", "TextEncodeQwenImageEditPlus",
+                               "TE_Qwen_Image_2_1_Prompt_Enhancer", "关闭"], {"default": "自动"}),
                 "upscale_method": (["nearest-exact", "bilinear", "area", "bicubic", "lanczos"], {"default": "bilinear"}),
                 # 0 = 不缩放（保持原分辨率）。>0 时按总像素数等比缩放，可填任意数字。
                 "megapixels": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 16.0, "step": 0.01}),
@@ -272,12 +276,338 @@ class TaiYangMultiAudioLoader:
         return tuple(results)
 
 
+# ---------------------------------------------------------------- 面部去高光
+# 算法在 face_dehighlight.py（纯 numpy/cv2/torch，不依赖 ComfyUI），这里只做节点封装。
+# 两个模型下拉都是每次打开工作流时实时扫盘得到，往目录里丢模型就会出现在下拉里。
+
+
+def _face_bbox_models():
+    """扫 models/ultralytics/bbox/ 下的 .pt / .onnx 作为人脸检测模型候选。"""
+    d = os.path.join(folder_paths.models_dir, "ultralytics", "bbox")
+    if not os.path.isdir(d):
+        return ["face_yolov8m.pt"]
+    files = sorted(f for f in os.listdir(d) if f.lower().endswith((".pt", ".onnx")))
+    return files or ["face_yolov8m.pt"]
+
+
+def _face_parse_models():
+    """扫 models/RMBG/ 下同时含 config.json 与 preprocessor_config.json 的子目录。"""
+    root = os.path.join(folder_paths.models_dir, "RMBG")
+    if not os.path.isdir(root):
+        return ["segformer_face"]
+    out = []
+    for name in sorted(os.listdir(root)):
+        p = os.path.join(root, name)
+        if not os.path.isdir(p):
+            continue
+        need = ("config.json", "preprocessor_config.json")
+        if all(os.path.exists(os.path.join(p, f)) for f in need):
+            out.append(name)
+    return out or ["segformer_face"]
+
+
+def _save_compare_preview(arr, tag, prefix="facedeh"):
+    """把一张图写进 temp 目录，供节点内的「原图 / 结果」对比面板读取。
+
+    temp 目录由 ComfyUI 提供静态访问（/view?type=temp），无需额外起服务。
+    用 compress_level=1 而不是默认 6：1536² 的图能快好几倍，体积大一点无所谓。
+    """
+    try:
+        name = f"ty_{prefix}_{tag}_{uuid.uuid4().hex[:12]}.png"
+        Image.fromarray(arr).save(os.path.join(folder_paths.get_temp_directory(), name), compress_level=1)
+        return {"filename": name, "subfolder": "", "type": "temp"}
+    except Exception as e:
+        print(f"[TaiYang] 对比预览写入失败: {e}")
+        return None
+
+
+class TaiYangFaceDehighlight:
+    """图片 → 本节点 → 去高光图片。
+
+    内部自带人脸检测 + 肤色解析 + 取色回填，**不需要任何外部节点配合**：
+    YOLO 找脸 → segformer 分出 skin/nose → 亮度阈值选高光 →
+    在「非皮肤 ∪ 高光」禁区里迭代模糊回填取纯肤色 → 按羽化蒙版贴回。
+
+    眉毛、眼睛、嘴唇、头发都在取样禁区里，永远不参与取色，
+    所以不会出现眉部发黑、唇部发红的问题。
+
+    节点内还会显示「原图 / 结果」对比面板（鼠标移进去即跟随，不用拖）。
+    """
+
+    CATEGORY = "TaiYang"
+    FUNCTION = "run"
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "highlight_threshold": ("FLOAT", {
+                    "default": 0.80, "min": 0.30, "max": 1.00, "step": 0.01,
+                    "display": "slider",
+                    "tooltip": "高光阈值。越大 → 选中的高光范围越小（只压最亮的点）",
+                }),
+                "yolo_model": (_face_bbox_models(), {
+                    "tooltip": "人脸检测模型，位于 models/ultralytics/bbox/",
+                }),
+                "segformer_model": (_face_parse_models(), {
+                    "tooltip": "人脸解析模型，位于 models/RMBG/<名字>/",
+                }),
+            },
+            "optional": {
+                "fill_strength": ("FLOAT", {
+                    "default": 0.80, "min": 0.0, "max": 1.0, "step": 0.01,
+                    "display": "slider",
+                    "tooltip": "填充强度。0 = 不动，1 = 全量填色",
+                }),
+                "填充明暗": ("FLOAT", {
+                    "default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01,
+                    "display": "slider",
+                    "tooltip": "填进去那层肤色的明暗。负 = 更暗（加深立体感），"
+                               "正 = 更亮（避免填完发灰）；0 = 严格按周边肤色",
+                }),
+                "feather": ("INT", {
+                    "default": 10, "min": 0, "max": 100, "step": 1,
+                    "tooltip": "高光区羽化，接缝明显就加大",
+                }),
+                "rounds": ("INT", {
+                    "default": 3, "min": 1, "max": 10, "step": 1,
+                    "tooltip": "肤色扩散轮数。填出来的块还有残留就加一轮",
+                }),
+            },
+        }
+
+    def run(self, image, highlight_threshold, yolo_model, segformer_model,
+            fill_strength=0.80, feather=10, rounds=3, 填充明暗=0.0):
+        # 延迟导入：即使缺 ultralytics / transformers，也不至于让整个节点包加载失败
+        from .face_dehighlight import dehighlight
+
+        def num(v, d):
+            """空字符串 / 非法值一律回落默认，绝不让它抛出去。"""
+            try:
+                f = float(v)
+                return f if f == f else float(d)
+            except (TypeError, ValueError):
+                return float(d)
+
+        highlight_threshold = num(highlight_threshold, 0.80)
+        fill_strength = num(fill_strength, 0.80)
+        feather = int(num(feather, 10))
+        rounds = int(num(rounds, 3))
+        fill_brightness = num(填充明暗, 0.0)
+
+        bbox_dir = os.path.join(folder_paths.models_dir, "ultralytics", "bbox")
+        yolo_path = yolo_model if os.path.isabs(yolo_model) else os.path.join(bbox_dir, yolo_model)
+
+        parse_dir = segformer_model
+        if not os.path.isabs(parse_dir):
+            parse_dir = os.path.join(folder_paths.models_dir, "RMBG", segformer_model)
+
+        outs = []
+        before = None
+        for i in range(image.shape[0]):
+            arr = (image[i].detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            if i == 0:
+                before = arr
+            outs.append(dehighlight(
+                arr, yolo_path, parse_dir,
+                highlight_threshold=float(highlight_threshold),
+                fill_strength=float(fill_strength),
+                feather=int(feather),
+                rounds=int(rounds),
+                fill_brightness=float(fill_brightness),
+            ))
+        batch = np.stack([o.astype(np.float32) / 255.0 for o in outs], axis=0)
+
+        # 对比面板只对比第一张（批量时其余张不重复占 temp 空间）
+        ui = {}
+        if before is not None and outs:
+            a = _save_compare_preview(before, "before")
+            b = _save_compare_preview(outs[0], "after")
+            if a and b:
+                ui["ty_compare"] = [a, b]
+
+        return {"ui": ui, "result": (torch.from_numpy(batch),)}
+
+
+# 「图片调整」的 12 个滑杆：(节点上显示的参数名, 算法层关键字, 默认值, 提示)
+# 顺序就是节点上从上到下的顺序，按「光调 → 色彩 → 细节 → 效果」分组排。
+_ADJUST_PARAMS = [
+    ("曝光", "exposure", 4, "整体明暗。每 100 ≈ ±1 档光"),
+    ("对比度", "contrast", 0, "以中灰为轴，压/放黑白两端"),
+    ("高光", "highlights", 6, "只作用于亮部。负数压高光救回死白，正数提亮高光"),
+    ("阴影", "shadows", -14, "只作用于暗部。负数压暗加深层次，正数提亮暗部"),
+    ("鲜明度", "brilliance", 11, "低饱和处加饱和 + 中间调提亮，做出通透感；已经很艳的地方少动"),
+    ("饱和度", "saturation", 0, "整体加/减彩。拉到 -100 变黑白"),
+    ("色温", "temperature", -4, "正数偏暖（加红减蓝），负数偏冷（加蓝减红）"),
+    ("色调", "tint", 0, "正数偏品红（减绿），负数偏绿"),
+    ("色相", "hue", 0, "整体转色相，±100 = ±180°"),
+    ("清晰度", "clarity", 0, "中频局部对比，加通透感（PS / ACR 的清晰度）"),
+    ("锐化", "sharpen", 0, "高频锐化（USM），提细节边缘"),
+    ("暗角", "vignette", 0, "正数压暗四角，负数四角发光"),
+]
+
+
+class TaiYangImageAdjust:
+    """图片调整：一套手机修图滑杆 + 几个 PS 常用参数，共 13 项。
+
+    参数名全部中文，方便对着 PS / 修图软件里的叫法调；前 12 项范围一律 -100 ~ +100，
+    0 = 不动，正负对称；第 13 项「效果强度」是 0 ~ 100 的整体强度。
+    默认值就是常用配方
+    （曝光+4 / 鲜明度+11 / 高光+6 / 阴影-14 / 色温-4，其余 0，效果强度 100）。
+
+    计算顺序 色温 → 色调 → 曝光 → 对比度 → 高光/阴影 → 色相 → 饱和度
+    → 鲜明度 → 清晰度 → 锐化 → 暗角 → 效果强度：
+    先白平衡和曝光，后面按亮度加权的步骤才有意义；对比度放在高光/阴影之前；
+    饱和类放在细节之前，清晰度/锐化只做亮度细节，不会把噪点染成彩点；
+    暗角永远最后；效果强度只是最后把结果按比例混回原图，不参与计算。
+
+    为什么叫「效果强度」而不是「透明度」：它不改画面明暗、也不输出 alpha，
+    只决定前面 12 项的效果上几成（100 = 全上，0 = 原图）。
+    参数本身很轻时（比如默认那套只有 3~4 个灰阶的改动），强度减半后不足 2 个灰阶，
+    肉眼本来就分辨不出——这时把强度当「减弱重效果」用才有意义。
+
+    节点面板是「左边原图 + 右边滑块」：跑一次之后原图会被缓存成底图，
+    之后拖任意滑块都在前端直接重算重画，不用反复执行节点，方便边拖边看。
+    右列顶部还有个预设下拉（原图 / 通用风格 5 种 / 电影调色 3 种 / 类型片调色 5 种 /
+    默认配方），点一下整套参数就位，每个参数旁边也能直接填数字。
+    下拉下面可以给当前这套参数起名、点「保存」存进「我的预设」（浏览器本地），
+    选中后点「删除」即可移除；内置预设不会被删掉。
+    输入接 IMAGE、输出接 IMAGE，参数照常写进工作流。
+    """
+
+    CATEGORY = "TaiYang"
+    FUNCTION = "run"
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        spec = {"image": ("IMAGE",)}
+        for cn, _en, default, tip in _ADJUST_PARAMS:
+            spec[cn] = ("INT", {
+                "default": default, "min": -100, "max": 100, "step": 1,
+                "display": "slider", "tooltip": tip,
+            })
+        # 第 13 个参数：效果强度。口径和上面 12 项不同（0 ~ 100，不是 ±100），
+        # 所以单独加；放在最后，旧工作流按位置取参数不会被它挤歪。
+        spec["效果强度"] = ("INT", {
+            "default": 100, "min": 0, "max": 100, "step": 1,
+            "display": "slider",
+            "tooltip": "前面 12 项的效果整体上几成。100 = 全量生效，0 = 原图；"
+                       "它不改明暗、不输出 alpha，只按比例把调整结果混回原图",
+        })
+        return {"required": spec}
+
+    def run(self, image, **kw):
+        from .image_adjust import adjust
+
+        def num(v, d):
+            """空字符串 / 非法值一律回落默认，绝不让它抛出去。"""
+            try:
+                f = float(v)
+                return f if f == f else float(d)   # f != f 即 NaN
+            except (TypeError, ValueError):
+                return float(d)
+
+        # 中文参数名 → 算法层英文关键字，改名不会牵动算法
+        args = {en: num(kw.get(cn), default) for cn, en, default, _ in _ADJUST_PARAMS}
+        # 兼容旧工作流 / API 调用里可能残留的旧名「透明度」
+        args["opacity"] = num(kw.get("效果强度", kw.get("透明度")), 100)
+
+        outs = []
+        before = None
+        for i in range(image.shape[0]):
+            arr = (image[i].detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            if i == 0:
+                before = arr
+            outs.append(adjust(arr, **args))
+        batch = np.stack([o.astype(np.float32) / 255.0 for o in outs], axis=0)
+
+        ui = {}
+        if before is not None and outs:
+            # 原图单独下发一路：前端拿它做「拖滑块即时出效果」的底图，
+            # 这样调参数不用反复执行节点。
+            src = _save_compare_preview(before, "src", prefix="adjust")
+            if src:
+                ui["ty_adjust_src"] = [src]
+            a = _save_compare_preview(before, "before", prefix="adjust")
+            b = _save_compare_preview(outs[0], "after", prefix="adjust")
+            if a and b:
+                ui["ty_compare"] = [a, b]
+
+        return {"ui": ui, "result": (torch.from_numpy(batch),)}
+
+
+class TaiYangImageCompare:
+    """图片对比：接 A / B 两路图片，节点内叠加显示，鼠标移进去就能扫着比。
+
+    专门用来看「改前 / 改后」的差异，本身不改图——输出直接把 B 图原样递出去，
+    所以想存图的话后面接一个 SaveImage 就行；不接也不影响对比。
+
+    两图尺寸不同也能比，但叠加时 A 会被拉到 B 的显示矩形里对齐，
+    面板底部会提示尺寸不一致。
+    """
+
+    CATEGORY = "TaiYang"
+    FUNCTION = "run"
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    # 本节点本质是「看图的地方」，和 PreviewImage 一样算输出端。
+    # 不加这一行的话：ComfyUI 只执行「输出节点 + 它们的上游」，
+    # 输出端口没接下游时整条链子不在执行路径上，run() 根本不会跑，
+    # ui.ty_compare 也就永远不回来 —— 面板一直是空白的。
+    OUTPUT_NODE = True
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        # 两路都声明成 optional：它是个「看图的地方」，忘了接线不该让整条队列报错，
+        # 更不该把同一张图里其他正常的输出节点一起带崩。
+        return {
+            "optional": {
+                "image_a": ("IMAGE", {
+                    "tooltip": "A 图，显示在面板左半边（标签「A」）",
+                }),
+                "image_b": ("IMAGE", {
+                    "tooltip": "B 图，显示在面板右半边（标签「B」），也是本节点的输出",
+                }),
+            },
+        }
+
+    def run(self, image_a=None, image_b=None):
+        def first_u8(t):
+            x = t[0] if getattr(t, "ndim", 3) == 4 else t
+            return (x.detach().cpu().numpy() * 255.0).clip(0, 255).round().astype(np.uint8)
+
+        ui = {}
+        if image_a is not None and image_b is not None:
+            try:
+                a_img = _save_compare_preview(first_u8(image_a), "before", prefix="cmp")
+                b_img = _save_compare_preview(first_u8(image_b), "after", prefix="cmp")
+                if a_img and b_img:
+                    ui["ty_compare"] = [a_img, b_img]
+            except Exception as e:
+                print(f"[图片对比] 预览生成失败: {e}")
+
+        # 没接 B 就递一张 8×8 占位图，下游接了 SaveImage 也只是多存张小图，不会崩
+        out = image_b if image_b is not None else torch.zeros((1, 8, 8, 3))
+        return {"ui": ui, "result": (out,)}
+
+
 NODE_CLASS_MAPPINGS = {
     "TaiYangMultiImageLoader": TaiYangMultiImageLoader,
-    "TaiYangMultiAudioLoader": TaiYangMultiAudioLoader
+    "TaiYangMultiAudioLoader": TaiYangMultiAudioLoader,
+    "TaiYangFaceDehighlight": TaiYangFaceDehighlight,
+    "TaiYangImageAdjust": TaiYangImageAdjust,
+    "TaiYangImageCompare": TaiYangImageCompare
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
     "TaiYangMultiImageLoader": "Multi Image Loader",
-    "TaiYangMultiAudioLoader": "Multi Audio Loader"
+    "TaiYangMultiAudioLoader": "Multi Audio Loader",
+    "TaiYangFaceDehighlight": "面部去高光（只取肤色）",
+    "TaiYangImageAdjust": "图片调整",
+    "TaiYangImageCompare": "图片对比"
 }
