@@ -140,6 +140,8 @@ function bottomLayout(nodeH) {
 function clampNodeSize(node) {
   const s = node?.size;
   if (!s) return node;
+  // DOM 面板模式下尺寸由面板自己算，这里不要插手
+  if (node.__tyDomPanel) return node;
   if (!(s[0] >= MIN_NODE_W)) s[0] = MIN_NODE_W;
   const minH = minHeightFor(node);
   if (!(s[1] >= minH)) s[1] = minH;
@@ -245,9 +247,12 @@ function setAudios(node, files) {
   node._audios = list.slice();
   // 音频增删后最小高度会变（按已用行数），重新钳一次：
   // 删音频后要顶回去，加音频后要跟着长出来，否则控件会挡住内容。
-  const minH = minHeightFor(node);
-  if (node.size && node.size[1] < minH) node.size[1] = minH;
-  if (node.size && node.size[0] < MIN_NODE_W) node.size[0] = MIN_NODE_W;
+  // DOM 面板下高度由面板控制，别在这里改 size。
+  if (!node.__tyDomPanel) {
+    const minH = minHeightFor(node);
+    if (node.size && node.size[1] < minH) node.size[1] = minH;
+    if (node.size && node.size[0] < MIN_NODE_W) node.size[0] = MIN_NODE_W;
+  }
   // 音频列表变了：按新顺序重新对齐裁剪区间（同名音频也各自独立）
   pruneTrims(node, oldNames, oldTrims);
   // **预取音频数据**：新上传的音频必须有时长才会画裁剪竖线与时间刻度。
@@ -1421,6 +1426,10 @@ app.registerExtension({
     nodeType.prototype.onDrawForeground = function (ctx) {
       origDraw?.apply(this, arguments);
 
+      // 已挂 DOM 面板（multi_audio_dom.js）时不再自绘：
+      // Node 2.0（Vue 节点）不画画布，自绘内容会整个消失。
+      if (this.__tyDomPanel) return;
+
       // 折叠时必须整体跳过自绘：LiteGraph 折叠后仍会调用 onDrawForeground，
       // 若继续画，网格与底部条会跑到节点框外的画布上（节点只剩一条标题栏）。
       if (isCollapsed(this)) return;
@@ -1953,6 +1962,9 @@ app.registerExtension({
 
     const origMove = nodeType.prototype.onMouseMove;
     nodeType.prototype.onMouseMove = function (e, pos) {
+      // DOM 面板接管后，画布上不再有可点的长条 / 竖线 / 模式条
+      if (this.__tyDomPanel) return origMove?.apply(this, arguments);
+
       // 折叠时不更新 hover / 拖拽，自绘区域已不再显示
       if (isCollapsed(this)) return origMove?.apply(this, arguments);
 
@@ -2030,6 +2042,9 @@ app.registerExtension({
 
     const origUp = nodeType.prototype.onMouseUp;
     nodeType.prototype.onMouseUp = function (e, pos) {
+      // DOM 面板接管后，裁剪竖线的拖动由行内 canvas 自己处理
+      if (this.__tyDomPanel) return origUp?.apply(this, arguments);
+
       // 0) 裁剪竖线拖动结束
       if (this._dragTrim) {
         this._dragTrim = null;
@@ -2063,6 +2078,10 @@ app.registerExtension({
 
     const origDown = nodeType.prototype.onMouseDown;
     nodeType.prototype.onMouseDown = function (e, pos) {
+      // DOM 面板接管后，点击全在 DOM 里处理；这里必须放行，
+      // 否则会按几何位置误判成“点在模式条上”而吃掉事件
+      if (this.__tyDomPanel) return origDown?.apply(this, arguments);
+
       // 折叠时节点只剩标题栏，自绘区域全部不可交互，直接交回 LiteGraph
       if (isCollapsed(this)) return origDown?.apply(this, arguments);
 
@@ -2152,3 +2171,31 @@ app.registerExtension({
     };
   },
 });
+/* ---------------------------------------------------------------------------
+ * 供 multi_audio_dom.js（DOM 面板）复用。
+ * 自动连线、输出槽、裁剪区间、试听、波形全都只此一份，DOM 面板只负责画和收输入。
+ * ------------------------------------------------------------------------- */
+export {
+  MAX_AUDIOS,
+  MODE_OPTIONS,
+  LONG_REF_AUDIO_SEC,
+  getWidget,
+  getAudioFiles,
+  setAudios,
+  getMode,
+  audioUrl,
+  uploadOne,
+  durOf,
+  exactDurOf,
+  getAudioBuffer,
+  togglePreview,
+  stopPreview,
+  previewPosition,
+  waveformPeaks,
+  trimAt,
+  setTrim,
+  truncateName,
+  formatRulerSec,
+  syncConnections,
+  reorderList,
+};

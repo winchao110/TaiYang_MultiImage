@@ -191,6 +191,8 @@ function bottomLayout(nodeH) {
 function clampNodeSize(node) {
   const s = node?.size;
   if (!s) return node;
+  // DOM 面板模式下尺寸由面板自己算（addDOMWidget 的 getHeight），这里不要插手
+  if (node.__tyDomPanel) return node;
   if (!(s[0] >= MIN_NODE_W)) s[0] = MIN_NODE_W;
   const minH = minHeightFor(node);
   if (!(s[1] >= minH)) s[1] = minH;
@@ -408,9 +410,12 @@ function setImages(node, files) {
   // 图片增删后最小高度会变（按已用行数），重新钳一次。
   // 删图后如果节点比新的下限还矮要顶回去；
   // 加图后如果节点不够高也要跟着长出来，否则新图会被底部控件挡住。
-  const minH = minHeightFor(node);
-  if (node.size && node.size[1] < minH) node.size[1] = minH;
-  if (node.size && node.size[0] < MIN_NODE_W) node.size[0] = MIN_NODE_W;
+  // DOM 面板下高度由面板控制，别在这里改 size。
+  if (!node.__tyDomPanel) {
+    const minH = minHeightFor(node);
+    if (node.size && node.size[1] < minH) node.size[1] = minH;
+    if (node.size && node.size[0] < MIN_NODE_W) node.size[0] = MIN_NODE_W;
+  }
   node.setDirtyCanvas(true, true);
 }
 
@@ -1135,6 +1140,11 @@ app.registerExtension({
     nodeType.prototype.onDrawForeground = function (ctx) {
       origDraw?.apply(this, arguments);
 
+      // 已挂 DOM 面板（multi_image_dom.js）时不再自绘：
+      // Node 2.0（Vue 节点）根本不画画布，自绘内容会整个消失，
+      // 所以界面统一交给 DOM，画布这边只负责“什么都不画”。
+      if (this.__tyDomPanel) return;
+
       // 折叠时必须整体跳过自绘：LiteGraph 折叠后仍会调用 onDrawForeground，
       // 若继续画，网格与底部条会跑到节点框外的画布上（节点只剩一条标题栏）。
       if (isCollapsed(this)) return;
@@ -1616,6 +1626,9 @@ const editScale = function (node, zone) {
 
     const origMove = nodeType.prototype.onMouseMove;
     nodeType.prototype.onMouseMove = function (e, pos) {
+      // DOM 面板接管后，画布上不再有可点的网格 / 缩放条
+      if (this.__tyDomPanel) return origMove?.apply(this, arguments);
+
       // 折叠时不更新 hover / 拖拽，自绘区域已不再显示
       if (isCollapsed(this)) return origMove?.apply(this, arguments);
 
@@ -1677,6 +1690,9 @@ const editScale = function (node, zone) {
 
     const origUp = nodeType.prototype.onMouseUp;
     nodeType.prototype.onMouseUp = function (e, pos) {
+      // DOM 面板接管后，拖拽排序走 HTML5 drag / drop，画布这边不再介入
+      if (this.__tyDomPanel) return origUp?.apply(this, arguments);
+
       // 1) 单击（按下后没越过阈值）：静默复位，不产生任何变化
       if (this._press) {
         resetDrag(this);
@@ -1702,6 +1718,10 @@ const editScale = function (node, zone) {
 
     const origDown = nodeType.prototype.onMouseDown;
     nodeType.prototype.onMouseDown = function (e, pos) {
+      // DOM 面板接管后，点击全在 DOM 里处理；这里必须放行，
+      // 否则会按几何位置误判成“点在缩放条 / 模式条上”而吃掉事件
+      if (this.__tyDomPanel) return origDown?.apply(this, arguments);
+
       // 折叠时节点只剩标题栏，自绘区域全部不可交互，直接交回 LiteGraph
       if (isCollapsed(this)) return origDown?.apply(this, arguments);
 
@@ -1790,3 +1810,28 @@ const editScale = function (node, zone) {
     };
   },
 });
+
+/* ---------------------------------------------------------------------------
+ * 供 multi_image_dom.js（DOM 面板）复用。
+ * 业务逻辑只此一份，DOM 面板只负责画和收输入，避免两边各写一遍、行为漂移。
+ * ------------------------------------------------------------------------- */
+export {
+  MAX_IMAGES,
+  MODE_OPTIONS,
+  UPSCALE_METHODS,
+  DEFAULT_STEPS,
+  getWidget,
+  getImageFiles,
+  setImages,
+  getMode,
+  getMegapixels,
+  setMegapixels,
+  getUpscaleMethod,
+  setUpscaleMethod,
+  getResolutionSteps,
+  setResolutionSteps,
+  uploadOne,
+  syncConnections,
+  reorderList,
+  scaledSize,
+};
