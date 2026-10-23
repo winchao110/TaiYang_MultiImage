@@ -15,7 +15,6 @@ import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 
 const NODE_NAMES = [
-  "TaiYangFaceDehighlight",          // 面部去高光（纯算法）
   "TaiYangFaceDehighlightInpaint",   // 面部去高光（重绘·保纹理）
   "TaiYangImageAdjust",              // 图片调整
   "TaiYangImageCompare",             // 图片对比
@@ -31,7 +30,6 @@ const KNOB_R = 14;                    // 把手半径，用于贴边时收一下
 // 图片调整有自己的左右分栏面板（左边图、右边滑块，拖滑块实时预览），见 image_adjust_panel.js，
 // 但它的参数兜底仍然由本文件的 NUMERIC_DEFAULTS / healNumericWidgets 负责。
 const PANEL_NODES = [
-  "TaiYangFaceDehighlight",          // 面部去高光（纯算法）
   "TaiYangFaceDehighlightInpaint",   // 面部去高光（重绘·保纹理）
   "TaiYangImageCompare",             // 图片对比
   "TaiYangSmallFaceErase",           // 小脸涂抹
@@ -471,8 +469,11 @@ function applyCompare(node, pair) {
  * graphToPrompt（最后一道，提交前逐个数字参数体检）。
  */
 const NUMERIC_DEFAULTS = {
-  TaiYangFaceDehighlight: {
-    highlight_threshold: 0.8, fill_strength: 0.8, 填充明暗: 0.0, feather: 10, rounds: 3,
+  TaiYangFaceDehighlightInpaint: {
+    高光阈值: 0.75, 种子: 123456789, 步数: 28, 降噪: 0.45,
+  },
+  TaiYangSmallFaceErase: {
+    检测阈值: 0.12, 保留脸数: 1, 涂抹倍数: 1.8,
   },
   TaiYangImageAdjust: {
     曝光: 4, 对比度: 0, 高光: 6, 阴影: -14, 鲜明度: 11, 饱和度: 0,

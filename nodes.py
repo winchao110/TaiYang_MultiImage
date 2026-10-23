@@ -338,124 +338,14 @@ def _save_compare_preview(arr, tag, prefix="facedeh"):
         return None
 
 
-class TaiYangFaceDehighlight:
-    """图片 → 本节点 → 去高光图片。
-
-    内部自带人脸检测 + 肤色解析 + 取色回填，**不需要任何外部节点配合**：
-    YOLO 找脸 → segformer 分出 skin/nose → 亮度阈值选高光 →
-    在「非皮肤 ∪ 高光」禁区里迭代模糊回填取纯肤色 → 按羽化蒙版贴回。
-
-    眉毛、眼睛、嘴唇、头发都在取样禁区里，永远不参与取色，
-    所以不会出现眉部发黑、唇部发红的问题。
-
-    节点内还会显示「原图 / 结果」对比面板（鼠标移进去即跟随，不用拖）。
-    """
-
-    CATEGORY = "TaiYang"
-    FUNCTION = "run"
-    RETURN_TYPES = ("IMAGE",)
-    RETURN_NAMES = ("image",)
-
-    @classmethod
-    def INPUT_TYPES(cls):
-        return {
-            "required": {
-                "image": ("IMAGE",),
-                "highlight_threshold": ("FLOAT", {
-                    "default": 0.80, "min": 0.30, "max": 1.00, "step": 0.01,
-                    "display": "slider",
-                    "tooltip": "高光阈值。越大 → 选中的高光范围越小（只压最亮的点）",
-                }),
-                "yolo_model": (_face_bbox_models(), {
-                    "tooltip": "人脸检测模型，位于 models/ultralytics/bbox/",
-                }),
-                "segformer_model": (_face_parse_models(), {
-                    "tooltip": "人脸解析模型，位于 models/RMBG/<名字>/",
-                }),
-            },
-            "optional": {
-                "fill_strength": ("FLOAT", {
-                    "default": 0.80, "min": 0.0, "max": 1.0, "step": 0.01,
-                    "display": "slider",
-                    "tooltip": "填充强度。0 = 不动，1 = 全量填色",
-                }),
-                "填充明暗": ("FLOAT", {
-                    "default": 0.0, "min": -1.0, "max": 1.0, "step": 0.01,
-                    "display": "slider",
-                    "tooltip": "填进去那层肤色的明暗。负 = 更暗（加深立体感），"
-                               "正 = 更亮（避免填完发灰）；0 = 严格按周边肤色",
-                }),
-                "feather": ("INT", {
-                    "default": 10, "min": 0, "max": 100, "step": 1,
-                    "tooltip": "高光区羽化，接缝明显就加大",
-                }),
-                "rounds": ("INT", {
-                    "default": 3, "min": 1, "max": 10, "step": 1,
-                    "tooltip": "肤色扩散轮数。填出来的块还有残留就加一轮",
-                }),
-            },
-        }
-
-    def run(self, image, highlight_threshold, yolo_model, segformer_model,
-            fill_strength=0.80, feather=10, rounds=3, 填充明暗=0.0):
-        # 延迟导入：即使缺 ultralytics / transformers，也不至于让整个节点包加载失败
-        from .face_dehighlight import dehighlight
-
-        def num(v, d):
-            """空字符串 / 非法值一律回落默认，绝不让它抛出去。"""
-            try:
-                f = float(v)
-                return f if f == f else float(d)
-            except (TypeError, ValueError):
-                return float(d)
-
-        highlight_threshold = num(highlight_threshold, 0.80)
-        fill_strength = num(fill_strength, 0.80)
-        feather = int(num(feather, 10))
-        rounds = int(num(rounds, 3))
-        fill_brightness = num(填充明暗, 0.0)
-
-        bbox_dir = os.path.join(folder_paths.models_dir, "ultralytics", "bbox")
-        yolo_path = yolo_model if os.path.isabs(yolo_model) else os.path.join(bbox_dir, yolo_model)
-
-        parse_dir = segformer_model
-        if not os.path.isabs(parse_dir):
-            parse_dir = os.path.join(folder_paths.models_dir, "RMBG", segformer_model)
-
-        outs = []
-        before = None
-        for i in range(image.shape[0]):
-            arr = (image[i].detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
-            if i == 0:
-                before = arr
-            outs.append(dehighlight(
-                arr, yolo_path, parse_dir,
-                highlight_threshold=float(highlight_threshold),
-                fill_strength=float(fill_strength),
-                feather=int(feather),
-                rounds=int(rounds),
-                fill_brightness=float(fill_brightness),
-            ))
-        batch = np.stack([o.astype(np.float32) / 255.0 for o in outs], axis=0)
-
-        # 对比面板只对比第一张（批量时其余张不重复占 temp 空间）
-        ui = {}
-        if before is not None and outs:
-            a = _save_compare_preview(before, "before")
-            b = _save_compare_preview(outs[0], "after")
-            if a and b:
-                ui["ty_compare"] = [a, b]
-
-        return {"ui": ui, "result": (torch.from_numpy(batch),)}
-
-
 class TaiYangFaceDehighlightInpaint:
     """面部去高光 · 重绘版：只把脸部高光那一小块送进 SDXL 局部重画。
 
-    和「面部去高光（只取肤色）」的区别：
-    那个是把高光区的颜色直接换掉（快、不用大模型，但肤质是"抹"出来的）；
-    这个让模型把高光区重画一遍（denoise 0.45 保留原结构），毛孔和皮肤纹理是
+    让模型把高光区重画一遍（denoise 0.45 保留原结构），毛孔和皮肤纹理是
     重新生成的，所以叫保纹理。代价是要加载一个 SDXL 底模、要跑采样。
+
+    最早的「只取肤色」纯算法节点已从节点列表移除，但 face_dehighlight.py
+    里的算法模块保留着 —— 本节点的遮罩完全靠它的 _face_boxes / _skin_mask。
 
     参数只留最关键的几项，其余（羽化、遮罩外扩、cfg、采样器、提示词）都按
     原始工作流写死：羽化 4px / 外扩 2px / cfg 5 / dpmpp_2m + karras。
@@ -829,7 +719,6 @@ class TaiYangSmallFaceErase:
 NODE_CLASS_MAPPINGS = {
     "TaiYangMultiImageLoader": TaiYangMultiImageLoader,
     "TaiYangMultiAudioLoader": TaiYangMultiAudioLoader,
-    "TaiYangFaceDehighlight": TaiYangFaceDehighlight,
     "TaiYangFaceDehighlightInpaint": TaiYangFaceDehighlightInpaint,
     "TaiYangImageAdjust": TaiYangImageAdjust,
     "TaiYangImageCompare": TaiYangImageCompare,
@@ -837,9 +726,8 @@ NODE_CLASS_MAPPINGS = {
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "TaiYangMultiImageLoader": "Multi Image Loader",
-    "TaiYangMultiAudioLoader": "Multi Audio Loader",
-    "TaiYangFaceDehighlight": "面部去高光（只取肤色）",
+    "TaiYangMultiImageLoader": "多图载入",
+    "TaiYangMultiAudioLoader": "多音频载入",
     "TaiYangFaceDehighlightInpaint": "面部去高光（重绘·保纹理）",
     "TaiYangImageAdjust": "图片调整",
     "TaiYangImageCompare": "图片对比",
