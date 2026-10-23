@@ -724,13 +724,116 @@ class TaiYangImageCompare:
         return {"ui": ui, "result": (out,)}
 
 
+# ---------------------------------------------------------------- 小脸涂抹
+# 算法在 small_face_erase.py，这里只做节点封装。
+
+
+class TaiYangSmallFaceErase:
+    """把小脸涂成纯色，让大模型只参考主视图那张大脸。
+
+    多视角人像参考图（一张大脸 + 若干张正面/侧面小脸）直接喂给大模型时，
+    小脸会把注意力分走。这里按「面积最大的那张算主脸」把其余的整片涂掉。
+
+    全流程纯 CV，不加载任何大模型：YOLO 检脸 + 圆角矩形填色，1 秒内出结果。
+    身体、头发、衣服一律不动，只盖住脸。
+
+    为什么不按位置判断谁是小脸：素材里小脸的位置不固定（右上、中上、左侧都可能），
+    但面积差得很干净（实测主脸 4.07%，小脸 0.40% / 0.29%），所以直接按面积排序。
+    """
+
+    CATEGORY = "TaiYang"
+    FUNCTION = "run"
+    RETURN_TYPES = ("IMAGE", "MASK")
+    RETURN_NAMES = ("image", "mask")
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "人脸模型": (_face_bbox_models(), {
+                    "tooltip": "人脸检测模型，位于 models/ultralytics/bbox/",
+                }),
+                "检测阈值": ("FLOAT", {
+                    "default": 0.12, "min": 0.02, "max": 0.90, "step": 0.01,
+                    "tooltip": "放低才能检出纯侧脸（实测侧脸 conf 0.81）；"
+                               "如果画面里的非人脸被误涂，就调高一些",
+                }),
+                "保留脸数": ("INT", {
+                    "default": 1, "min": 0, "max": 8, "step": 1,
+                    "tooltip": "按面积从大到小保留前几张脸不涂。"
+                               "1 = 只留最大的主脸（常用）；0 = 全涂；2 = 主脸 + 第二大的也留着",
+                }),
+                "涂抹倍数": ("FLOAT", {
+                    "default": 1.8, "min": 1.0, "max": 4.0, "step": 0.1,
+                    "tooltip": "小脸框居中放大倍数。YOLO 对纯侧脸框得偏窄，1.5 倍会露鼻子和嘴，"
+                               "1.8 倍实测刚好全盖住、头发基本还在；2.2 以上开始吃头发",
+                }),
+                "填充色": (["自动背景", "纯白", "纯黑", "中灰"], {
+                    "default": "自动背景",
+                    "tooltip": "自动背景 = 取画布四边像素的中位色，纯色背景素材最贴合、看不出补丁",
+                }),
+            },
+        }
+
+    def run(self, image, **kw):
+        from .small_face_erase import erase_small_faces, FILL_CHOICES
+
+        def num(v, d):
+            try:
+                f = float(v)
+                return f if f == f else float(d)
+            except (TypeError, ValueError):
+                return float(d)
+
+        conf = num(kw.get("检测阈值"), 0.12)
+        keep = int(num(kw.get("保留脸数"), 1))
+        scale = num(kw.get("涂抹倍数"), 1.8)
+        fill = kw.get("填充色") or "自动背景"
+        if fill not in FILL_CHOICES:
+            fill = "自动背景"
+
+        yolo_name = kw.get("人脸模型") or "face_yolov8m.pt"
+        yolo_path = os.path.join(folder_paths.models_dir, "ultralytics", "bbox", yolo_name)
+        if not os.path.exists(yolo_path):
+            raise FileNotFoundError(
+                f"找不到人脸检测模型「{yolo_name}」，请确认它在 models/ultralytics/bbox/ 下"
+            )
+
+        outs, masks = [], []
+        before = None
+        for i in range(image.shape[0]):
+            arr = (image[i].detach().cpu().numpy() * 255.0 + 0.5).clip(0, 255).astype(np.uint8)
+            if i == 0:
+                before = arr
+            o, m, _nf, _ne = erase_small_faces(
+                arr, yolo_path, conf=conf, keep_top=keep, scale=scale, fill=fill,
+            )
+            outs.append(o)
+            masks.append(m)
+
+        batch = np.stack([o.astype(np.float32) / 255.0 for o in outs], axis=0)
+        mask = np.stack(masks, axis=0).astype(np.float32)
+
+        # 复用面部去高光的对比面板：左原图 / 右涂抹后
+        ui = {}
+        if before is not None and outs:
+            a = _save_compare_preview(before, "before", prefix="smallface")
+            b = _save_compare_preview(outs[0], "after", prefix="smallface")
+            if a and b:
+                ui["ty_compare"] = [a, b]
+
+        return {"ui": ui, "result": (torch.from_numpy(batch), torch.from_numpy(mask))}
+
+
 NODE_CLASS_MAPPINGS = {
     "TaiYangMultiImageLoader": TaiYangMultiImageLoader,
     "TaiYangMultiAudioLoader": TaiYangMultiAudioLoader,
     "TaiYangFaceDehighlight": TaiYangFaceDehighlight,
     "TaiYangFaceDehighlightInpaint": TaiYangFaceDehighlightInpaint,
     "TaiYangImageAdjust": TaiYangImageAdjust,
-    "TaiYangImageCompare": TaiYangImageCompare
+    "TaiYangImageCompare": TaiYangImageCompare,
+    "TaiYangSmallFaceErase": TaiYangSmallFaceErase
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -739,5 +842,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TaiYangFaceDehighlight": "面部去高光（只取肤色）",
     "TaiYangFaceDehighlightInpaint": "面部去高光（重绘·保纹理）",
     "TaiYangImageAdjust": "图片调整",
-    "TaiYangImageCompare": "图片对比"
+    "TaiYangImageCompare": "图片对比",
+    "TaiYangSmallFaceErase": "小脸涂抹（去参考图杂脸）"
 }

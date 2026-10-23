@@ -19,6 +19,7 @@ const NODE_NAMES = [
   "TaiYangFaceDehighlightInpaint",   // 面部去高光（重绘·保纹理）
   "TaiYangImageAdjust",              // 图片调整
   "TaiYangImageCompare",             // 图片对比
+  "TaiYangSmallFaceErase",           // 小脸涂抹
 ];
 const WIDGET_NAME = "compare_view";   // 只作内部标识，不参与序列化
 const WIDGET_TYPE = "TY_COMPARE_DOM";
@@ -33,6 +34,7 @@ const PANEL_NODES = [
   "TaiYangFaceDehighlight",          // 面部去高光（纯算法）
   "TaiYangFaceDehighlightInpaint",   // 面部去高光（重绘·保纹理）
   "TaiYangImageCompare",             // 图片对比
+  "TaiYangSmallFaceErase",           // 小脸涂抹
 ];
 
 // 各节点的角标与空状态文案（图片对比用 A / B，另外两个是原图 / 结果）
@@ -42,6 +44,8 @@ const LABELS = {
 const EMPTY_HINT = {
   TaiYangImageCompare:
     "接上 A / B 两张图即可对比<b>鼠标移进来即可左右上下来回扫</b>",
+  TaiYangSmallFaceErase:
+    "接上参考图运行即可<b>非主视图的小脸会被涂成纯色</b>",
 };
 
 /* ------------------------------------------------------------------ 样式 */
