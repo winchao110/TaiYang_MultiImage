@@ -21,7 +21,8 @@ const NODE_NAME = "TaiYangImageAdjust";
 const PANEL_H = 462;              // 面板高度（预设行 26 + 13 行滑杆 + 存预设行 24 + 间距）
 const MIN_NODE_W = 680;           // 建节点时的最小宽度，太窄图就没了
 const CTRL_W = 198;               // 右侧控制列宽度（名字 + 滑杆 + 数值框）
-const MAX_PREVIEW = 720;          // 预览图最长边（超过就降采样，保证拖动跟手）
+const MAX_PREVIEW = 1440;         // 静止后的预览分辨率（最长边），够放大看毛孔
+const PREVIEW_DRAG = 720;         // 拖动中临时降到的分辨率，保证跟手
 
 // 顺序 = 面板里从上到下的顺序。第三项是「缺省值」，用于工作流里没这个控件时的兜底。
 const PARAMS = [
@@ -892,19 +893,49 @@ function schedule(node) {
   if (node.__adjRaf) return;
   node.__adjRaf = requestAnimationFrame(() => {
     node.__adjRaf = 0;
-    render(node);
+    // 先把低清档的结果顶上去，拖动才不会一顿一顿的
+    render(node, false);
+    // 手停下来再补一帧高清（连续拖动会不断重置，只在真停下来时才跑）
+    clearTimeout(node.__adjHiTimer);
+    node.__adjHiTimer = setTimeout(() => {
+      node.__adjHiTimer = 0;
+      render(node, true);
+    }, 160);
   });
 }
 
-function render(node) {
+/**
+ * 画一帧。
+ *
+ * @param hi true = 用高分辨率源（1440，清晰）；false = 用拖动档（720，跟手）
+ *
+ * 两档的源在 loadSource 里都准备好了：高清扫像素多、算法慢（十几项逐像素），
+ * 拖滑块时跑不动；而拖动过程糊一点没人看得出，停下来 160ms 后自动补高清。
+ */
+function render(node, hi) {
   const st = node.__adj;
   if (!st || !st.src || !st.w) return;
   const t0 = performance.now();
   const p = collect(node);
-  const out = applyAdjust(st.src, st.w, st.h, p);
-  st.imgData.data.set(out);
-  st.ctx.putImageData(st.imgData, 0, 0);
+
+  if (hi || !st.lo) {
+    const out = applyAdjust(st.src, st.w, st.h, p);
+    st.imgData.data.set(out);
+    st.ctx.putImageData(st.imgData, 0, 0);
+  } else {
+    const lo = st.lo;
+    const out = applyAdjust(lo.src, lo.w, lo.h, p);
+    if (!st.loImgData || st.loImgData.width !== lo.w) {
+      st.loImgData = lo.ctx.createImageData(lo.w, lo.h);
+    }
+    st.loImgData.data.set(out);
+    lo.ctx.putImageData(st.loImgData, 0, 0);
+    // 放大回主画布：GPU 采样，比在小画布上直接显示清楚得多，也不会闪
+    st.ctx.drawImage(lo.canvas, 0, 0, st.w, st.h);
+  }
+
   node.__adjMs = Math.round(performance.now() - t0);
+  node.__adjHi = !!hi;
   updateBadge(node, p);
 }
 
@@ -942,27 +973,54 @@ function updateBadge(node, p) {
   el.classList.add("on");
 }
 
-/** 把图片读进离屏 canvas，降采样到 MAX_PREVIEW，缓存像素 */
+/** 把图片读进离屏 canvas，同时备好「高清」和「拖动」两档像素 */
 function loadSource(node, img, onFail) {
   const url = viewUrl(img);
   const im = new Image();
   im.onload = () => {
-    const scale = Math.min(1, MAX_PREVIEW / Math.max(im.naturalWidth, im.naturalHeight));
-    const w = Math.max(1, Math.round(im.naturalWidth * scale));
-    const h = Math.max(1, Math.round(im.naturalHeight * scale));
-
     const st = node.__adj;
+    const nat = Math.max(im.naturalWidth, im.naturalHeight);
+    // 按最长边算目标尺寸；原图本来就小就保持原尺寸
+    const fit = (cap) => {
+      const s = Math.min(1, cap / nat);
+      return [
+        Math.max(1, Math.round(im.naturalWidth * s)),
+        Math.max(1, Math.round(im.naturalHeight * s)),
+      ];
+    };
+
+    const [w, h] = fit(MAX_PREVIEW);
     st.w = w;
     st.h = h;
     st.url = url;
     st.canvas.width = w;
     st.canvas.height = h;
     st.ctx = st.canvas.getContext("2d", { willReadFrequently: true });
+    st.ctx.imageSmoothingQuality = "high";
     st.ctx.drawImage(im, 0, 0, w, h);
     st.imgData = st.ctx.getImageData(0, 0, w, h);
     st.src = new Uint8ClampedArray(st.imgData.data);   // 原始像素，永远从它重新算
+
+    // 拖动档单独用一张离屏 canvas：主画布要一直保持高清尺寸，
+    // 拖动时算小图再放大贴上去，尺寸不跳、也不会闪。
+    const [lw, lh] = fit(PREVIEW_DRAG);
+    st.lo = null;
+    st.loImgData = null;
+    if (lw < w || lh < h) {
+      const loCanvas = document.createElement("canvas");
+      loCanvas.width = lw;
+      loCanvas.height = lh;
+      const loCtx = loCanvas.getContext("2d", { willReadFrequently: true });
+      loCtx.imageSmoothingQuality = "high";
+      loCtx.drawImage(im, 0, 0, lw, lh);
+      st.lo = {
+        w: lw, h: lh, canvas: loCanvas, ctx: loCtx,
+        src: new Uint8ClampedArray(loCtx.getImageData(0, 0, lw, lh).data),
+      };
+    }
+
     st.hint.style.display = "none";
-    render(node);
+    render(node, true);
     node.setDirtyCanvas?.(true, true);
   };
   im.onerror = () => {
