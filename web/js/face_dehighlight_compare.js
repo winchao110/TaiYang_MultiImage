@@ -15,9 +15,10 @@ import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 
 const NODE_NAMES = [
-  "TaiYangFaceDehighlight",   // 面部去高光
-  "TaiYangImageAdjust",       // 图片调整
-  "TaiYangImageCompare",      // 图片对比
+  "TaiYangFaceDehighlight",          // 面部去高光（纯算法）
+  "TaiYangFaceDehighlightInpaint",   // 面部去高光（重绘·保纹理）
+  "TaiYangImageAdjust",              // 图片调整
+  "TaiYangImageCompare",             // 图片对比
 ];
 const WIDGET_NAME = "compare_view";   // 只作内部标识，不参与序列化
 const WIDGET_TYPE = "TY_COMPARE_DOM";
@@ -29,8 +30,9 @@ const KNOB_R = 14;                    // 把手半径，用于贴边时收一下
 // 图片调整有自己的左右分栏面板（左边图、右边滑块，拖滑块实时预览），见 image_adjust_panel.js，
 // 但它的参数兜底仍然由本文件的 NUMERIC_DEFAULTS / healNumericWidgets 负责。
 const PANEL_NODES = [
-  "TaiYangFaceDehighlight",   // 面部去高光
-  "TaiYangImageCompare",      // 图片对比
+  "TaiYangFaceDehighlight",          // 面部去高光（纯算法）
+  "TaiYangFaceDehighlightInpaint",   // 面部去高光（重绘·保纹理）
+  "TaiYangImageCompare",             // 图片对比
 ];
 
 // 各节点的角标与空状态文案（图片对比用 A / B，另外两个是原图 / 结果）

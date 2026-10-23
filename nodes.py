@@ -306,6 +306,23 @@ def _face_parse_models():
     return out or ["segformer_face"]
 
 
+def _checkpoint_models():
+    """重绘用的 SDXL 底模候选。
+
+    默认挑写实底模（名字里带 epicrealism / realism / real 之类），
+    挑不到就退第一个 —— combo 的默认值必须真实存在于列表里，
+    否则前端会拿不到值。
+    """
+    names = list(folder_paths.get_filename_list("checkpoints"))
+    if not names:
+        return ["（models/checkpoints 里没有底模）"]
+    for kw in ("epicrealism", "realism", "realistic", "real"):
+        hit = next((n for n in names if kw in n.lower()), None)
+        if hit:
+            return [hit] + [n for n in names if n != hit]
+    return names
+
+
 def _save_compare_preview(arr, tag, prefix="facedeh"):
     """把一张图写进 temp 目录，供节点内的「原图 / 结果」对比面板读取。
 
@@ -426,6 +443,117 @@ class TaiYangFaceDehighlight:
         if before is not None and outs:
             a = _save_compare_preview(before, "before")
             b = _save_compare_preview(outs[0], "after")
+            if a and b:
+                ui["ty_compare"] = [a, b]
+
+        return {"ui": ui, "result": (torch.from_numpy(batch),)}
+
+
+class TaiYangFaceDehighlightInpaint:
+    """面部去高光 · 重绘版：只把脸部高光那一小块送进 SDXL 局部重画。
+
+    和「面部去高光（只取肤色）」的区别：
+    那个是把高光区的颜色直接换掉（快、不用大模型，但肤质是"抹"出来的）；
+    这个让模型把高光区重画一遍（denoise 0.45 保留原结构），毛孔和皮肤纹理是
+    重新生成的，所以叫保纹理。代价是要加载一个 SDXL 底模、要跑采样。
+
+    参数只留最关键的几项，其余（羽化、遮罩外扩、cfg、采样器、提示词）都按
+    原始工作流写死：羽化 4px / 外扩 2px / cfg 5 / dpmpp_2m + karras。
+    """
+
+    CATEGORY = "TaiYang"
+    FUNCTION = "run"
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "高光阈值": ("FLOAT", {
+                    "default": 0.75, "min": 0.30, "max": 0.99, "step": 0.01,
+                    "display": "slider",
+                    "tooltip": "亮度超过它的皮肤像素才算高光。越大 → 选中的范围越小；"
+                               "脸上油光面积大就调低，只想去最亮的几点就调高",
+                }),
+                "底模": (_checkpoint_models(), {
+                    "tooltip": "重绘用的 SDXL 底模，位于 models/checkpoints/。"
+                               "写实系底模效果最好；换底模会连带换掉它自带的 CLIP 和 VAE",
+                }),
+                "YOLO模型": (_face_bbox_models(), {
+                    "tooltip": "人脸检测模型，位于 models/ultralytics/bbox/。只用来框出脸，防止重绘跑到脸外",
+                }),
+                "segformer模型": (_face_parse_models(), {
+                    "tooltip": "人脸解析模型，位于 models/RMBG/<名字>/。分出皮肤和鼻子，"
+                               "眉毛眼睛嘴唇头发都不参与，所以不会把眼睛嘴唇画花",
+                }),
+                "种子": ("INT", {
+                    "default": 123456789, "min": 0, "max": 0xFFFFFFFFFFFFFFFF,
+                    "control_after_generate": True,
+                    "tooltip": "同一张图同参数，换个种子重绘结果会有细微差别",
+                }),
+                "步数": ("INT", {
+                    "default": 28, "min": 1, "max": 100, "step": 1,
+                    "tooltip": "采样步数。28 是原工作流的值；降噪只有 0.45，实际有效步数约为 步数×0.45",
+                }),
+                "降噪": ("FLOAT", {
+                    "default": 0.45, "min": 0.05, "max": 1.0, "step": 0.01,
+                    "display": "slider",
+                    "tooltip": "改多少。0.45 = 保纹理（推荐）；调高更干净但会丢毛孔、"
+                               "可能把人画成另一个人；调低改不干净",
+                }),
+            },
+        }
+
+    def run(self, image, **kw):
+        from .face_dehighlight_inpaint import dehighlight_inpaint
+
+        def num(v, d):
+            try:
+                f = float(v)
+                return f if f == f else float(d)
+            except (TypeError, ValueError):
+                return float(d)
+
+        threshold = num(kw.get("高光阈值"), 0.75)
+        seed = int(num(kw.get("种子"), 123456789))
+        steps = int(num(kw.get("步数"), 28))
+        denoise = num(kw.get("降噪"), 0.45)
+
+        ckpt_name = kw.get("底模") or ""
+        ckpt_path = folder_paths.get_full_path("checkpoints", ckpt_name)
+        if not ckpt_path:
+            raise FileNotFoundError(
+                f"找不到底模「{ckpt_name}」，请确认它在 models/checkpoints/ 下，"
+                "或在下拉里换一个"
+            )
+
+        yolo_name = kw.get("YOLO模型") or "face_yolov8m.pt"
+        yolo_path = os.path.join(folder_paths.models_dir, "ultralytics", "bbox", yolo_name)
+
+        seg_name = kw.get("segformer模型") or "segformer_face"
+        seg_dir = os.path.join(folder_paths.models_dir, "RMBG", seg_name)
+
+        outs = []
+        before = None
+        for i in range(image.shape[0]):
+            arr = (image[i].detach().cpu().numpy() * 255.0 + 0.5).clip(0, 255).astype(np.uint8)
+            if i == 0:
+                before = arr
+            outs.append(dehighlight_inpaint(
+                arr, ckpt_path, yolo_path, seg_dir,
+                highlight_threshold=threshold,
+                seed=seed + i,          # 批量时每张换种子，免得几张重绘得一模一样
+                steps=steps,
+                denoise=denoise,
+            ))
+        batch = np.stack([o.astype(np.float32) / 255.0 for o in outs], axis=0)
+
+        ui = {}
+        if before is not None and outs:
+            a = _save_compare_preview(before, "before", prefix="dehinp")
+            b = _save_compare_preview(outs[0], "after", prefix="dehinp")
             if a and b:
                 ui["ty_compare"] = [a, b]
 
@@ -600,6 +728,7 @@ NODE_CLASS_MAPPINGS = {
     "TaiYangMultiImageLoader": TaiYangMultiImageLoader,
     "TaiYangMultiAudioLoader": TaiYangMultiAudioLoader,
     "TaiYangFaceDehighlight": TaiYangFaceDehighlight,
+    "TaiYangFaceDehighlightInpaint": TaiYangFaceDehighlightInpaint,
     "TaiYangImageAdjust": TaiYangImageAdjust,
     "TaiYangImageCompare": TaiYangImageCompare
 }
@@ -608,6 +737,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "TaiYangMultiImageLoader": "Multi Image Loader",
     "TaiYangMultiAudioLoader": "Multi Audio Loader",
     "TaiYangFaceDehighlight": "面部去高光（只取肤色）",
+    "TaiYangFaceDehighlightInpaint": "面部去高光（重绘·保纹理）",
     "TaiYangImageAdjust": "图片调整",
     "TaiYangImageCompare": "图片对比"
 }
