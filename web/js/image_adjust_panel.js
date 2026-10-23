@@ -899,6 +899,8 @@ function schedule(node) {
     clearTimeout(node.__adjHiTimer);
     node.__adjHiTimer = setTimeout(() => {
       node.__adjHiTimer = 0;
+      // 这 160ms 里节点可能已经被删了，别对着脱离文档的画布白算一帧
+      if (!node.__adj?.canvas?.isConnected) return;
       render(node, true);
     }, 160);
   });
