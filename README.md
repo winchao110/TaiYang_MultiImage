@@ -10,6 +10,10 @@
 
 > **GitHub**：<https://github.com/winchao110/TaiYang_MultiImage>
 >
+> **整合包（模型 + 工作流）**：<https://pan.quark.cn/s/bc37598df71d>
+> 节点要用的 SDXL 底模、人脸检测、人脸解析模型和示例工作流都打包在里面，
+> 懒得逐个找模型就直接从这里拿。
+>
 > **前两个节点主要为 MiniMax H3 与 Qwen Image 2.1 服务。**
 > 有了它们，给 H3 / Qwen 喂多张参考图（音频）不需要再串一长串加载节点，
 > 放好图就会自动接到对应的多图参考槽位上。
@@ -697,6 +701,17 @@ ComfyUI/models/
     └── model.safetensors
 ```
 
+### 整合包（模型 + 工作流）
+
+模型不想逐个去找的话，直接下这个整合包：
+
+**<https://pan.quark.cn/s/bc37598df71d>**
+
+里面就是上面这套模型加可以直接跑的示例工作流。模型按相同的目录结构丢进
+`ComfyUI/models/` 对应位置即可，不用改任何路径。
+`checkpoints` 里的 SDXL 底模换成你自己惯用的写实底模也没问题，
+节点的「底模」下拉是实时读 `models/checkpoints` 的，有哪个就能选哪个。
+
 ## 兼容性
 
 - ComfyUI 1.5x 及以上（前端 autogrow API）
@@ -715,6 +730,7 @@ ComfyUI/models/
 
 ## 变更记录
 
+- **文档**：补上整合包（模型 + 工作流）地址 <https://pan.quark.cn/s/bc37598df71d>
 - **移除**：`面部去高光（只取肤色）` 节点从节点列表删除（算法模块 `face_dehighlight.py` 保留，
   供「重绘·保纹理」复用）。旧工作流里如果还留着这个节点，加载后会显示为缺失节点
 - **改名**：`Multi Image Loader` → **多图载入**，`Multi Audio Loader` → **多音频载入**
