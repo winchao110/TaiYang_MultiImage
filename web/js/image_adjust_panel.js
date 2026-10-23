@@ -8,7 +8,8 @@
  *   节点跑过一次后，后端把「原图」写到 temp 并通过 ui.ty_adjust_src 下发；
  *   前端把它读进 canvas，之后每动一次滑块，就在浏览器里重算一遍这 12 项调整
  *   并重画 canvas。算法与 image_adjust.py 一一对应（同样的顺序、同样的系数），
- *   所以预览看到的就是后端会产出的结果（差别只在预览按 MAX_PREVIEW 降采样过）。
+ *   所以预览看到的就是后端会产出的结果（差别只在预览按档位降采样过，
+ *   档位可选 512 / 720 / 1080 / 1440，图上方那个下拉就是）。
  *
  * 原生参数 widget 仍然保留（序列化、API 调用都靠它），只是被压成 0 高度，
  * 视觉上由右侧这列滑块代替。
@@ -18,11 +19,15 @@ import { app } from "/scripts/app.js";
 import { api } from "/scripts/api.js";
 
 const NODE_NAME = "TaiYangImageAdjust";
-const PANEL_H = 462;              // 面板高度（预设行 26 + 13 行滑杆 + 存预设行 24 + 间距）
+const PANEL_H = 492;              // 面板高度（预览档位行 24 + 预设行 26 + 13 行滑杆 + 存预设行 24 + 间距）
 const MIN_NODE_W = 680;           // 建节点时的最小宽度，太窄图就没了
 const CTRL_W = 198;               // 右侧控制列宽度（名字 + 滑杆 + 数值框）
-const MAX_PREVIEW = 1440;         // 静止后的预览分辨率（最长边），够放大看毛孔
-const PREVIEW_DRAG = 720;         // 拖动中临时降到的分辨率，保证跟手
+
+// 预览分辨率档位（按**最长边**算）。默认 720 —— 1080 / 1440 在 4K 图上算得慢，拖起来会卡，
+// 想要细节时手动往上拨。拖动过程还会再降到档位的 55%，保证跟手。
+const QUALITY_LEVELS = [512, 720, 1080, 1440];
+const QUALITY_DEFAULT = 720;
+const QUALITY_STORE = "taiyang_adjust_quality_v1";
 
 // 顺序 = 面板里从上到下的顺序。第三项是「缺省值」，用于工作流里没这个控件时的兜底。
 const PARAMS = [
@@ -123,6 +128,17 @@ function ensureStyle() {
   background: #141519; box-shadow: inset 0 0 0 1px #2c2e36;
   user-select: none; -webkit-user-select: none;
 }
+.ty-adj-left {
+  flex: 1 1 auto; min-width: 0;
+  display: flex; flex-direction: column; gap: 6px;
+}
+/* 预览分辨率档位（图上方那行） */
+.ty-adj-quality {
+  flex: 0 0 24px; height: 24px;
+  display: flex; align-items: center; gap: 6px;
+  color: #8b909b; font-size: 11px; white-space: nowrap;
+}
+.ty-adj-quality select { width: 84px; }
 .ty-adj-view {
   position: relative; flex: 1 1 auto; min-width: 0;
   display: flex; align-items: center; justify-content: center;
@@ -176,8 +192,9 @@ function ensureStyle() {
 }
 /* 预设下拉 */
 .ty-adj-preset { flex: 0 0 26px; height: 26px; display: flex; align-items: center; }
-.ty-adj-preset select {
-  width: 100%; height: 24px; padding: 0 6px; border-radius: 5px;
+.ty-adj-preset select,
+.ty-adj-quality select {
+  height: 24px; padding: 0 6px; border-radius: 5px;
   background: #23252c; color: #dfe2e8; font-size: 11.5px; font-family: inherit;
   border: 1px solid #34373f; outline: none; cursor: pointer;
   appearance: none; -webkit-appearance: none;
@@ -188,8 +205,11 @@ function ensureStyle() {
   background-size: 4px 4px, 4px 4px;
   background-repeat: no-repeat;
 }
-.ty-adj-preset select:hover { border-color: #4a4e59; }
-.ty-adj-preset select option { background: #23252c; color: #dfe2e8; }
+.ty-adj-preset select { width: 100%; }
+.ty-adj-preset select:hover,
+.ty-adj-quality select:hover { border-color: #4a4e59; }
+.ty-adj-preset select option,
+.ty-adj-quality select option { background: #23252c; color: #dfe2e8; }
 .ty-adj-preset select optgroup { background: #23252c; color: #8b909b; font-size: 11px; }
 
 /* 预设名 + 保存 / 删除 */
@@ -510,6 +530,25 @@ function viewUrl(img) {
   return `/view?${q.toString()}`;
 }
 
+/* ---- 预览分辨率档位（存在 localStorage，所有节点共用） ---- */
+
+function readQualityStore() {
+  try {
+    const v = Number(localStorage.getItem(QUALITY_STORE));
+    return QUALITY_LEVELS.includes(v) ? v : QUALITY_DEFAULT;
+  } catch (_) {
+    return QUALITY_DEFAULT;
+  }
+}
+
+function writeQualityStore(cap) {
+  try {
+    localStorage.setItem(QUALITY_STORE, String(cap));
+  } catch (_) {
+    /* 隐私模式写不了就算了，不影响本次预览 */
+  }
+}
+
 function collect(node) {
   const p = {};
   for (const [, en, def] of PARAMS) p[en] = def / 100;
@@ -736,6 +775,36 @@ function buildPanel(node) {
   node.__adjToast = toastEl;
   view.append(cv, badge, toastEl, hint);
 
+  // ---- 图上方：预览分辨率档位
+  const left = document.createElement("div");
+  left.className = "ty-adj-left";
+  const qualRow = document.createElement("div");
+  qualRow.className = "ty-adj-quality";
+  const qualLabel = document.createElement("span");
+  qualLabel.textContent = "预览";
+  const qualSel = document.createElement("select");
+  for (const lv of QUALITY_LEVELS) {
+    const o = document.createElement("option");
+    o.value = String(lv);
+    o.textContent = lv + "p";
+    qualSel.appendChild(o);
+  }
+  qualSel.value = String(readQualityStore());
+  qualSel.title = "预览分辨率（按最长边算）。越高越清楚、越吃 CPU；拖动时会自动降到约 55% 保证跟手";
+  node.__adjQuality = qualSel;
+  // 下拉展开时别让画布把点击当成拖动节点
+  qualSel.addEventListener("pointerdown", (e) => e.stopPropagation());
+  qualSel.addEventListener("change", () => {
+    const cap = Number(qualSel.value);
+    writeQualityStore(cap);
+    const st = node.__adj;
+    if (!st?.origImg) return;          // 还没取到图，等加载完会按新档位建
+    buildSources(st, st.origImg, cap);
+    render(node, true);
+  });
+  qualRow.append(qualLabel, qualSel);
+  left.append(qualRow, view);
+
   const ctrl = document.createElement("div");
   ctrl.className = "ty-adj-ctrl";
 
@@ -884,7 +953,7 @@ function buildPanel(node) {
   }
 
   ctrl.append(presetRow, saveRow, rowsWrap);
-  root.append(view, ctrl);
+  root.append(left, ctrl);
   reflectPreset(node);
   return { root, cv, hint };
 }
@@ -975,52 +1044,63 @@ function updateBadge(node, p) {
   el.classList.add("on");
 }
 
-/** 把图片读进离屏 canvas，同时备好「高清」和「拖动」两档像素 */
+/**
+ * 按档位把原图重采样成「高清」和「拖动」两档像素，存在 st 上。
+ *
+ * @param cap 档位（最长边像素）。原图比档位小就保持原尺寸，绝不放大 ——
+ *            放大不会更清楚，只是白烧 CPU。
+ */
+function buildSources(st, im, cap) {
+  const nat = Math.max(im.naturalWidth, im.naturalHeight);
+  const fit = (c) => {
+    const s = Math.min(1, c / nat);
+    return [
+      Math.max(1, Math.round(im.naturalWidth * s)),
+      Math.max(1, Math.round(im.naturalHeight * s)),
+    ];
+  };
+
+  const [w, h] = fit(cap);
+  st.w = w;
+  st.h = h;
+  st.canvas.width = w;
+  st.canvas.height = h;
+  st.ctx = st.canvas.getContext("2d", { willReadFrequently: true });
+  st.ctx.imageSmoothingQuality = "high";
+  st.ctx.drawImage(im, 0, 0, w, h);
+  st.imgData = st.ctx.getImageData(0, 0, w, h);
+  st.src = new Uint8ClampedArray(st.imgData.data);   // 原始像素，永远从它重新算
+
+  // 拖动档单独用一张离屏 canvas：主画布要一直保持高清尺寸，
+  // 拖动时算小图再放大贴上去，尺寸不跳、也不会闪。
+  // 取档位的 55%（不低于 512）：档位越高，拖动时的省力越明显。
+  const lcap = Math.min(cap, Math.max(512, Math.round(cap * 0.55)));
+  const [lw, lh] = fit(lcap);
+  st.lo = null;
+  st.loImgData = null;
+  if (lw < w || lh < h) {
+    const loCanvas = document.createElement("canvas");
+    loCanvas.width = lw;
+    loCanvas.height = lh;
+    const loCtx = loCanvas.getContext("2d", { willReadFrequently: true });
+    loCtx.imageSmoothingQuality = "high";
+    loCtx.drawImage(im, 0, 0, lw, lh);
+    st.lo = {
+      w: lw, h: lh, canvas: loCanvas, ctx: loCtx,
+      src: new Uint8ClampedArray(loCtx.getImageData(0, 0, lw, lh).data),
+    };
+  }
+}
+
+/** 把图片读进来，按当前档位建好两档像素 */
 function loadSource(node, img, onFail) {
   const url = viewUrl(img);
   const im = new Image();
   im.onload = () => {
     const st = node.__adj;
-    const nat = Math.max(im.naturalWidth, im.naturalHeight);
-    // 按最长边算目标尺寸；原图本来就小就保持原尺寸
-    const fit = (cap) => {
-      const s = Math.min(1, cap / nat);
-      return [
-        Math.max(1, Math.round(im.naturalWidth * s)),
-        Math.max(1, Math.round(im.naturalHeight * s)),
-      ];
-    };
-
-    const [w, h] = fit(MAX_PREVIEW);
-    st.w = w;
-    st.h = h;
+    st.origImg = im;          // 留着原始位图，切换档位时直接从它重采样，不用再下载
     st.url = url;
-    st.canvas.width = w;
-    st.canvas.height = h;
-    st.ctx = st.canvas.getContext("2d", { willReadFrequently: true });
-    st.ctx.imageSmoothingQuality = "high";
-    st.ctx.drawImage(im, 0, 0, w, h);
-    st.imgData = st.ctx.getImageData(0, 0, w, h);
-    st.src = new Uint8ClampedArray(st.imgData.data);   // 原始像素，永远从它重新算
-
-    // 拖动档单独用一张离屏 canvas：主画布要一直保持高清尺寸，
-    // 拖动时算小图再放大贴上去，尺寸不跳、也不会闪。
-    const [lw, lh] = fit(PREVIEW_DRAG);
-    st.lo = null;
-    st.loImgData = null;
-    if (lw < w || lh < h) {
-      const loCanvas = document.createElement("canvas");
-      loCanvas.width = lw;
-      loCanvas.height = lh;
-      const loCtx = loCanvas.getContext("2d", { willReadFrequently: true });
-      loCtx.imageSmoothingQuality = "high";
-      loCtx.drawImage(im, 0, 0, lw, lh);
-      st.lo = {
-        w: lw, h: lh, canvas: loCanvas, ctx: loCtx,
-        src: new Uint8ClampedArray(loCtx.getImageData(0, 0, lw, lh).data),
-      };
-    }
-
+    buildSources(st, im, readQualityStore());
     st.hint.style.display = "none";
     render(node, true);
     node.setDirtyCanvas?.(true, true);
