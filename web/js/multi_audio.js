@@ -893,71 +893,150 @@ function findLastAutogrowSlot(node, groupPrefix) {
 }
 
 /**
- * 保证第 ordinal 个音频槽位存在，返回其下标；没有则 -1。
- *
- * 关键：不要自己 splice 造槽位。前端 autogrow 只认自己创建的槽
- * （自带 display_name，画布上显示短名）。正确做法是借前端自己的扩张逻辑，
- * 这里复刻其最小实现（造带 display_name 的完整槽对象）。
+ * 找第 ordinal 个 autogrow 槽位的下标；没有就返回 -1，**绝不自己造槽**。
+ * 原因同多图载入那边：前端 1.55 起 link 归属走 graph 内部索引，
+ * 手工 splice node.inputs 会把索引弄脏，进而叠出孤儿 link、存进工作流、
+ * 重开时全部画在第一个槽上（看着就是连错线）。详见 multi_image.js 同名注释。
  */
 function ensureAutogrowInput(node, groupPrefix, info, ordinal) {
-  const direct = findAutogrowSlot(node, groupPrefix, info, ordinal);
-  if (direct !== -1) return direct;
-  return addAutogrowGroup(node, groupPrefix, info, ordinal);
+  return findAutogrowSlot(node, groupPrefix, info, ordinal);
 }
 
-function addAutogrowGroup(node, groupPrefix, info, ordinal) {
-  const max = info?.max ?? 16;
-  if (ordinal >= max) return -1;
-  const specs = info?.inputSpecs || [];
-  if (!specs.length) return -1;
-
-  const isOptional = ordinal >= (info?.min ?? 0);
-  const local = slotLocalName(groupPrefix, info, ordinal);
-  const created = specs.map((spec) => ({
-    ...spec,
-    name: `${groupPrefix}.${local}`,
-    display_name: local,
-    isOptional: isOptional || !!spec.isOptional,
-    link: null,
-  }));
-
-  const at = findLastAutogrowSlot(node, groupPrefix);
-  const insertAt = at === -1 ? node.inputs.length : at + 1;
-
-  for (const slot of created) {
-    const twin = node.inputs.find((i) => i.name === slot.name && i.link != null);
-    if (twin) slot.link = twin.link;
+/** 取 graph.links 里所有指向 (nodeId, slotIndex) 的 link —— 包括孤儿 */
+function linksIntoSlot(graph, nodeId, slotIndex) {
+  const out = [];
+  const links = graph?.links;
+  if (!links) return out;
+  const visit = (l) => {
+    if (!l) return;
+    const tid = l.target_id ?? l.targetNode?.id;
+    const ts = l.target_slot ?? l.targetSlot;
+    if (tid === nodeId && ts === slotIndex) out.push(l);
+  };
+  if (typeof links.forEach === "function") {
+    links.forEach((v, k) => visit(v ?? (typeof links.get === "function" ? links.get(k) : null)));
+  } else {
+    for (const k in links) visit(links[k]);
   }
-
-  node.inputs.splice(insertAt, 0, ...created);
-
-  // 插入点之后的 link 目标槽位整体后移
-  const graph = node.graph || app.graph;
-  for (let i = insertAt; i < node.inputs.length; i++) {
-    const inp = node.inputs[i];
-    if (inp.link == null) continue;
-    const link = getLink(graph, inp.link);
-    if (link) link.target_slot = i;
-  }
-
-  node.setDirtyCanvas?.(true, true);
-  const idx = node.inputs.indexOf(created[0]);
-  return idx === -1 ? findAutogrowSlot(node, groupPrefix, info, ordinal) : idx;
+  return out;
 }
 
-function disconnectSlot(node, slotIndex) {
-  const inp = node.inputs?.[slotIndex];
-  if (!inp || inp.link == null) return;
+/** 硬删一条 link（官方 API 删不掉的孤儿走这里） */
+function removeLinkHard(graph, link) {
+  if (!graph || !link) return false;
+  let gone = false;
   try {
-    if (typeof node.disconnectInput === "function") {
-      node.disconnectInput(slotIndex, true);
-      return;
+    if (typeof link.disconnect === "function") {
+      link.disconnect(graph);
+      gone = getLink(graph, link.id) == null;
     }
-    const graph = node.graph || app.graph;
-    graph.disconnectInput(node, slotIndex, node);
   } catch (e) {
-    console.warn("[TaiYangMultiAudio] 断开失败", e);
+    /* 走兜底 */
   }
+  if (!gone) {
+    try {
+      if (typeof graph.removeLink === "function") {
+        graph.removeLink(link);
+        gone = getLink(graph, link.id) == null;
+      }
+    } catch (e) {
+      /* 继续兜底 */
+    }
+  }
+  if (!gone) {
+    try {
+      if (typeof graph.links?.delete === "function") graph.links.delete(link.id);
+      else if (graph.links) delete graph.links[link.id];
+      graph.incrementVersion?.();
+      gone = true;
+    } catch (e) {
+      console.warn("[TaiYangMultiAudio] 清理残留连线失败", e);
+    }
+  }
+  if (!gone) return false;
+  const origin = graph.getNodeById?.(link.origin_id);
+  const target = graph.getNodeById?.(link.target_id);
+  const arr = origin?.outputs?.[link.origin_slot]?.links;
+  if (Array.isArray(arr)) {
+    const at = arr.indexOf(link.id);
+    if (at !== -1) arr.splice(at, 1);
+  }
+  const tin = target?.inputs?.[link.target_slot];
+  if (tin && (tin.link === link.id || tin.link == null)) tin.link = null;
+  return true;
+}
+
+/**
+ * 叫前端把本组再扩一个槽出来：把本组最后一条（自己的）线断开再接回去，
+ * 借这次连接触发 autogrowInputConnected。没这条动作的话，
+ * 「最后一个槽本来就连着」的情况下扩张永远不会发生，后面几个音频连不上。
+ */
+function growAutogrowByReconnect(loader, target, groupPrefix) {
+  const graph = target.graph || app.graph;
+  if (!graph) return false;
+  const before = findLastAutogrowSlot(target, groupPrefix);
+  if (before === -1) return false;
+  const links = linksIntoSlot(graph, target.id, before);
+  const link = links.find((l) => (l.origin_id ?? null) === loader.id);
+  if (!link) return false;
+  const src = graph.getNodeById?.(link.origin_id);
+  if (!src) return false;
+  const outSlot = link.origin_slot;
+  disconnectSlot(target, before);
+  connectSlot(src, outSlot, target, before);
+  return findLastAutogrowSlot(target, groupPrefix) > before;
+}
+
+/**
+ * 断开某个输入槽：官方入口 + 孤儿硬删。
+ * 不能靠 `inp.link == null` 提前返回 —— 脏槽里正是 link 指向别处、孤儿还在。
+ */
+function disconnectSlot(node, slotIndex) {
+  const graph = node.graph || app.graph;
+  const inp = node.inputs?.[slotIndex];
+  if (!graph || !inp) return;
+
+  const doomed = linksIntoSlot(graph, node.id, slotIndex);
+  if (typeof node.disconnectInput === "function") {
+    try {
+      node.disconnectInput(slotIndex, true);
+    } catch (e) {
+      console.warn("[TaiYangMultiAudio] 断开失败", e);
+    }
+  }
+  for (const link of doomed) {
+    if (getLink(graph, link.id)) removeLinkHard(graph, link);
+  }
+  if (inp.link != null && !getLink(graph, inp.link)) inp.link = null;
+  node.setDirtyCanvas?.(true, true);
+}
+
+/** 同一槽挂了多条 link 的，只留一条（优先留 origin_slot 对得上的那条） */
+function pruneGroupLinks(loader, target, prefix, info) {
+  const graph = target.graph || app.graph;
+  if (!graph) return 0;
+  let removed = 0;
+  for (let i = 0; i < target.inputs.length; i++) {
+    const inp = target.inputs[i];
+    if (!isGroupSlot(prefix, inp.name)) continue;
+    const links = linksIntoSlot(graph, target.id, i);
+    if (links.length <= 1) continue;
+    const ord = ordinalOfSlot(prefix, info, inp.name);
+    let keeper = links[links.length - 1];
+    if (ord != null) {
+      const exact = links.find((l) => l.origin_id === loader.id && l.origin_slot === ord);
+      if (exact) keeper = exact;
+    }
+    for (const l of links) {
+      if (l === keeper) continue;
+      if (removeLinkHard(graph, l)) removed++;
+    }
+  }
+  if (removed) {
+    console.warn(`[TaiYangMultiAudio] 清理了 ${removed} 条残留连线（同一槽位重复）`);
+    target.setDirtyCanvas?.(true, true);
+  }
+  return removed;
 }
 
 /**
@@ -970,13 +1049,14 @@ function connectSlot(srcNode, outSlot, dstNode, dstSlotIndex) {
   const inp = dstNode.inputs?.[dstSlotIndex];
   if (!inp || !srcNode.outputs?.[outSlot]) return false;
 
-  if (inp.link != null) {
-    const graph = srcNode.graph || app.graph;
-    const existing = getLink(graph, inp.link);
+  const graph = srcNode.graph || app.graph;
+  // 不能只看 inp.link（legacy 视图只反映最后一条），脏槽里可能挂孤儿
+  const existing = linksIntoSlot(graph, dstNode.id, dstSlotIndex);
+  if (existing.length) {
     const sameOrigin =
-      existing &&
-      (existing.origin_id ?? null) === srcNode.id &&
-      (existing.origin_slot ?? null) === outSlot;
+      existing.length === 1 &&
+      (existing[0].origin_id ?? null) === srcNode.id &&
+      (existing[0].origin_slot ?? null) === outSlot;
     if (sameOrigin) return true;
     disconnectSlot(dstNode, dstSlotIndex);
   }
@@ -1066,7 +1146,7 @@ function syncOneTarget(node, target, count) {
       const ord = staticOrdinal(target.type, inp.name);
       if (ord === null || ord < cap) continue;
       const idx = target.inputs.indexOf(inp);
-      if (idx !== -1 && inp.link != null) disconnectSlot(target, idx);
+      if (idx !== -1) disconnectSlot(target, idx);
     }
     target.setDirtyCanvas?.(true, true);
     return;
@@ -1078,9 +1158,18 @@ function syncOneTarget(node, target, count) {
   const { prefix, info } = ag;
   const cap = Math.min(count, info?.max ?? MAX_AUDIOS, MAX_AUDIOS);
 
+  // 先收拾同一槽上的重复/孤儿连线，否则下面的 connect 会继续往上叠
+  pruneGroupLinks(node, target, prefix, info);
+
   for (let i = 0; i < cap; i++) {
-    const idx = ensureAutogrowInput(target, prefix, info, i);
-    if (idx === -1) continue;
+    let idx = ensureAutogrowInput(target, prefix, info, i);
+    if (idx === -1) {
+      // 前面可能是「同源跳过」，扩张不会被触发；断开重连一次把前端唤醒
+      if (growAutogrowByReconnect(node, target, prefix)) {
+        idx = ensureAutogrowInput(target, prefix, info, i);
+      }
+      if (idx === -1) continue;
+    }
     connectSlot(node, i, target, idx);
   }
 
@@ -1091,7 +1180,8 @@ function syncOneTarget(node, target, count) {
     const ord = ordinalOfSlot(prefix, info, inp.name);
     if (ord === null || ord < cap) continue;
     const idx = target.inputs.indexOf(inp);
-    if (idx !== -1 && inp.link != null) disconnectSlot(target, idx);
+    // 不再用 inp.link != null 预判：脏槽里可能还有孤儿
+    if (idx !== -1) disconnectSlot(target, idx);
   }
 
   target.setDirtyCanvas?.(true, true);
@@ -1116,18 +1206,21 @@ function ordinalOfSlot(groupPrefix, info, fullName) {
 function syncConnections(node) {
   const files = getAudioFiles(node);
   if (files.length === 0) {
+    const graph = node.graph || app.graph;
     const targets = collectTargets(node);
     for (const t of targets) {
       const ag = findAudioAutogrow(t);
       for (const inp of t.inputs?.slice() || []) {
-        if (inp.link == null) continue;
-        const link = getLink(t.graph || app.graph, inp.link);
-        if ((link?.origin_id ?? null) !== node.id) continue;
         const isAutoSlot = ag && isGroupSlot(ag.prefix, inp.name);
         const isStaticSlot = STATIC_TARGETS[t.type] && staticOrdinal(t.type, inp.name) !== null;
         if (!isAutoSlot && !isStaticSlot) continue;
         const idx = t.inputs.indexOf(inp);
-        if (idx !== -1) disconnectSlot(t, idx);
+        if (idx === -1) continue;
+        // 不靠 inp.link 预判：槽上可能只剩本节点留下的孤儿
+        const mine = linksIntoSlot(graph, t.id, idx).some(
+          (l) => (l.origin_id ?? null) === node.id
+        );
+        if (mine || inp.link != null) disconnectSlot(t, idx);
       }
     }
     syncOutputSlots(node, 1);

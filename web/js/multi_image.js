@@ -530,74 +530,209 @@ function findLastAutogrowSlot(node, groupPrefix) {
  * （onConnectionsChange -> autogrowInputConnected）并自动补出下一个槽。
  * 这里直接调它的 autogrow 定义来补，而不是伪造对象。
  */
+/**
+ * 找第 ordinal 个 autogrow 槽位的下标；没有就返回 -1，**绝不自己造槽**。
+ *
+ * 这里踩过这个节点包最狠的一个坑，记清楚，别再走回头路：
+ *
+ * 前端 1.55 起把「哪条 link 接在哪个槽上」搬进了 graph 内部索引
+ * （slotLinks.ts 的 inputLink / inputLinkId / outputHasLinks），
+ * node.inputs 只剩一个 legacy 视图。前端自己的扩槽函数 addAutogrowGroup
+ * 是靠 commitMutatedInputs -> replaceNodeInputs 把这套索引整体重建一遍才落地的。
+ *
+ * 老版本这里用 `node.inputs.splice()` 手工塞槽位，只动了数组、没重建索引，
+ * 于是连锁反应：
+ *   1. graph 认为这些槽「没连接」-> connectSlots 里 replacingLink 查成 null
+ *      -> 不替换旧线，直接 _addLink 追加；
+ *   2. 一个输入槽上叠出多条 link，inputs[slot].link 只显示最后一条，
+ *      其余全变孤儿（graph.links 里还在，但没人认领）；
+ *   3. 孤儿会被序列化写进工作流 JSON；
+ *   4. 重开工作流时前端照着 graph.links 画线 —— 所有孤儿都画在
+ *      ref_image_0 上，看起来就是「好几张图全连到参考图 1」= 连错线。
+ *
+ * 正确做法是根本不造槽：按 0,1,2… 顺序连线时，每连上「本组最后一个槽」，
+ * 前端 onConnectionsChange -> autogrowInputConnected 会同步补出下一个槽
+ * （dynamicWidgets.ts 里连接分支是同步调用，不是 rAF）。所以查不到就返回 -1，
+ * 交给外层 markRetry 下一轮再试。
+ */
 function ensureAutogrowInput(node, groupPrefix, info, ordinal) {
-  const direct = findAutogrowSlot(node, groupPrefix, info, ordinal);
-  if (direct !== -1) return direct;
-  return addAutogrowGroup(node, groupPrefix, info, ordinal);
+  return findAutogrowSlot(node, groupPrefix, info, ordinal);
 }
 
 /**
- * 复刻前端 addAutogrowGroup 的最小实现：按 inputSpecs 造一组槽并插到本组末尾，
- * 同时把其后所有 link 的 target_slot 顺延。
- * 之所以必须造带 display_name 的完整槽对象，是因为画布渲染与命中测试都依赖它。
+ * 叫前端把本组再扩一个槽出来。
+ *
+ * 前端只在「一条线刚连上本组最后一个槽」时才补下一个槽
+ * （autogrowInputConnected）。所以如果最后那个槽本来就连着正确的线，
+ * 我们判定同源直接跳过，扩张就永远不会发生 —— 表现为：脏工作流打开后
+ * 只有第 1 张图连得上，后面几张一直空着，补试 5 次也没用。
+ *
+ * 办法是把本组最后一条线「断开再原样接回去」，借这次连接把扩张唤醒。
+ * 全程走官方 connect / disconnectInput，不碰 node.inputs，索引不会脏。
+ *
+ * @returns 是否真的多出了一个槽
  */
-function addAutogrowGroup(node, groupPrefix, info, ordinal) {
-  const max = info?.max ?? 16;
-  if (ordinal >= max) return -1;
-  const specs = info?.inputSpecs || [];
-  if (!specs.length) return -1;
+function growAutogrowByReconnect(loader, target, groupPrefix) {
+  const graph = target.graph || app.graph;
+  if (!graph) return false;
 
-  const isOptional = ordinal >= (info?.min ?? 0);
-  const local = slotLocalName(groupPrefix, info, ordinal);
-  const created = specs.map((spec) => ({
-    ...spec,
-    name: `${groupPrefix}.${local}`,
-    // 前端就是靠 display_name 决定画布上显示短名还是全名，
-    // 缺了它就会显示成 ref_images.ref_image_0 这种全名
-    display_name: local,
-    isOptional: isOptional || !!spec.isOptional,
-    link: null,
-  }));
+  const before = findLastAutogrowSlot(target, groupPrefix);
+  if (before === -1) return false;
 
-  const at = findLastAutogrowSlot(node, groupPrefix);
-  const insertAt = at === -1 ? node.inputs.length : at + 1;
+  const links = linksIntoSlot(graph, target.id, before);
+  if (!links.length) return false;
+  // 只动自己接的线，别人的连接不去碰
+  const link = links.find((l) => (l.origin_id ?? null) === loader.id);
+  if (!link) return false;
 
-  // 复制既有同组槽位的 link，避免打断已有连线
-  for (const slot of created) {
-    const twin = node.inputs.find((i) => i.name === slot.name && i.link != null);
-    if (twin) slot.link = twin.link;
-  }
+  const src = graph.getNodeById?.(link.origin_id);
+  if (!src) return false;
+  const outSlot = link.origin_slot;
 
-  node.inputs.splice(insertAt, 0, ...created);
+  disconnectSlot(target, before);
+  connectSlot(src, outSlot, target, before);
 
-  // 插入点之后的 link 目标槽位整体后移
-  const graph = node.graph || app.graph;
-  for (let i = insertAt; i < node.inputs.length; i++) {
-    const inp = node.inputs[i];
-    if (inp.link == null) continue;
-    const link = getLink(graph, inp.link);
-    if (link) link.target_slot = i;
-  }
-
-  node.setDirtyCanvas?.(true, true);
-  const idx = node.inputs.indexOf(created[0]);
-  return idx === -1 ? findAutogrowSlot(node, groupPrefix, info, ordinal) : idx;
+  return findLastAutogrowSlot(target, groupPrefix) > before;
 }
 
-function disconnectSlot(node, slotIndex) {
-  const inp = node.inputs?.[slotIndex];
-  if (!inp || inp.link == null) return;
-  try {
-    // 节点级 API：node.disconnectInput(slot, keepDummy)
-    if (typeof node.disconnectInput === "function") {
-      node.disconnectInput(slotIndex, true);
-      return;
-    }
-    const graph = node.graph || app.graph;
-    graph.disconnectInput(node, slotIndex, node);
-  } catch (e) {
-    console.warn("[TaiYangMultiImage] 断开失败", e);
+/**
+ * 取 graph.links 里所有指向 (nodeId, slotIndex) 的 link —— 包括孤儿。
+ *
+ * 为什么不直接用 inputs[slot].link：那只是 legacy 视图，只反映「最后一条」。
+ * 一个槽上叠了多条时，除最后一条外都只能从这里翻出来。修理脏工作流靠它。
+ */
+function linksIntoSlot(graph, nodeId, slotIndex) {
+  const out = [];
+  const links = graph?.links;
+  if (!links) return out;
+  const visit = (l) => {
+    if (!l) return;
+    const tid = l.target_id ?? l.targetNode?.id;
+    const ts = l.target_slot ?? l.targetSlot;
+    if (tid === nodeId && ts === slotIndex) out.push(l);
+  };
+  if (typeof links.forEach === "function") {
+    // Map: forEach(value, key)；数组: forEach(value, index)。两种都能取到 link
+    links.forEach((v, k) => visit(v ?? (typeof links.get === "function" ? links.get(k) : null)));
+  } else {
+    for (const k in links) visit(links[k]);
   }
+  return out;
+}
+
+/** 硬删一条 link：官方 API 删不掉的孤儿走这里，顺手把两端槽位上的残留 id 清干净 */
+function removeLinkHard(graph, link) {
+  if (!graph || !link) return false;
+  let gone = false;
+  try {
+    if (typeof link.disconnect === "function") {
+      link.disconnect(graph);
+      gone = getLink(graph, link.id) == null;
+    }
+  } catch (e) {
+    /* 走下面的兜底 */
+  }
+  if (!gone) {
+    try {
+      if (typeof graph.removeLink === "function") {
+        graph.removeLink(link);
+        gone = getLink(graph, link.id) == null;
+      }
+    } catch (e) {
+      /* 继续兜底 */
+    }
+  }
+  if (!gone) {
+    try {
+      if (typeof graph.links?.delete === "function") graph.links.delete(link.id);
+      else if (graph.links) delete graph.links[link.id];
+      graph.incrementVersion?.();
+      gone = true;
+    } catch (e) {
+      console.warn("[TaiYangMultiImage] 清理残留连线失败", e);
+    }
+  }
+  if (!gone) return false;
+
+  // 两端槽位的 legacy 列表里可能还留着这个 id，一并抹掉
+  const origin = graph.getNodeById?.(link.origin_id);
+  const target = graph.getNodeById?.(link.target_id);
+  const strip = (arr) => {
+    if (!Array.isArray(arr)) return;
+    const at = arr.indexOf(link.id);
+    if (at !== -1) arr.splice(at, 1);
+  };
+  strip(origin?.outputs?.[link.origin_slot]?.links);
+  const tin = target?.inputs?.[link.target_slot];
+  if (tin && (tin.link === link.id || tin.link == null)) tin.link = null;
+  return true;
+}
+
+/**
+ * 断开某个输入槽。
+ *
+ * 不能用 `if (inp.link == null) return` 提前退：脏工作流里恰恰就是
+ * inputs[slot].link 指向别的一条，而 graph.links 里还挂着孤儿 ——
+ * 提前返回等于永久放弃清理，孤儿会跟着工作流一起存下去。
+ */
+function disconnectSlot(node, slotIndex) {
+  const graph = node.graph || app.graph;
+  const inp = node.inputs?.[slotIndex];
+  if (!graph || !inp) return;
+
+  const doomed = linksIntoSlot(graph, node.id, slotIndex);
+
+  // 先走官方入口：它会维护索引、触发 onConnectionsChange、顺带收拾 reroute
+  if (typeof node.disconnectInput === "function") {
+    try {
+      node.disconnectInput(slotIndex, true);
+    } catch (e) {
+      console.warn("[TaiYangMultiImage] 断开失败", e);
+    }
+  }
+
+  // 官方入口只删得掉「索引认为属于本槽」的那一条，剩下的孤儿逐个硬删
+  for (const link of doomed) {
+    if (getLink(graph, link.id)) removeLinkHard(graph, link);
+  }
+
+  if (inp.link != null && !getLink(graph, inp.link)) inp.link = null;
+  node.setDirtyCanvas?.(true, true);
+}
+
+/**
+ * 清理目标组里的脏连线：同一个槽上挂了多条 link 的，只留一条。
+ *
+ * 留哪条：优先留「来自本 loader 且 origin_slot 与本槽序号对得上」的那条
+ * （那才是上一轮 sync 该连的），否则留最后一条。其余全部硬删。
+ * 这既是给已经存坏的工作流做自愈，也顺手避免下一轮连出新孤儿。
+ */
+function pruneGroupLinks(loader, target, prefix, info) {
+  const graph = target.graph || app.graph;
+  if (!graph) return 0;
+  let removed = 0;
+  for (let i = 0; i < target.inputs.length; i++) {
+    const inp = target.inputs[i];
+    if (!isGroupSlot(prefix, inp.name)) continue;
+    const links = linksIntoSlot(graph, target.id, i);
+    if (links.length <= 1) continue;
+
+    const ord = ordinalOfSlot(prefix, info, inp.name);
+    let keeper = links[links.length - 1];
+    if (ord != null) {
+      const exact = links.find((l) => l.origin_id === loader.id && l.origin_slot === ord);
+      if (exact) keeper = exact;
+    }
+    for (const l of links) {
+      if (l === keeper) continue;
+      if (removeLinkHard(graph, l)) removed++;
+    }
+  }
+  if (removed) {
+    console.warn(`[TaiYangMultiImage] 清理了 ${removed} 条残留连线（同一槽位重复）`);
+    target.setDirtyCanvas?.(true, true);
+  }
+  return removed;
 }
 
 /**
@@ -612,13 +747,15 @@ function connectSlot(srcNode, outSlot, dstNode, dstSlotIndex) {
   const inp = dstNode.inputs?.[dstSlotIndex];
   if (!inp || !srcNode.outputs?.[outSlot]) return false;
 
-  if (inp.link != null) {
-    const graph = srcNode.graph || app.graph;
-    const existing = getLink(graph, inp.link);
+  const graph = srcNode.graph || app.graph;
+  // 判断「这槽上有没有线」不能只看 inp.link（legacy 视图只反映最后一条），
+  // 脏槽里可能挂着孤儿而 inp.link 是 null —— 那种情况直接 connect 会往上叠。
+  const existing = linksIntoSlot(graph, dstNode.id, dstSlotIndex);
+  if (existing.length) {
     const sameOrigin =
-      existing &&
-      (existing.origin_id ?? null) === srcNode.id &&
-      (existing.origin_slot ?? null) === outSlot;
+      existing.length === 1 &&
+      (existing[0].origin_id ?? null) === srcNode.id &&
+      (existing[0].origin_slot ?? null) === outSlot;
     if (sameOrigin) return true;
     disconnectSlot(dstNode, dstSlotIndex);
   }
@@ -712,7 +849,7 @@ function syncOneTarget(node, target, count) {
       if (ord < 0) continue;          // 不是本节点的图片槽
       if (ord < cap) continue;        // 仍在用，保留
       const idx = target.inputs.indexOf(inp);
-      if (idx !== -1 && inp.link != null) disconnectSlot(target, idx);
+      if (idx !== -1) disconnectSlot(target, idx);
     }
     target.setDirtyCanvas?.(true, true);
     // 目标槽缺失（工作流刚载入、对端输入槽还没初始化完）→ 记下待重试，
@@ -726,9 +863,24 @@ function syncOneTarget(node, target, count) {
   const { prefix, info } = ag;
   const cap = Math.min(count, info?.max ?? MAX_IMAGES, MAX_IMAGES);
 
+  // 先把本组上「一个槽挂多条」的脏连线收拾干净。
+  // 不收拾的话 connectSlot 判断不出已有连接，会在同一槽上继续叠孤儿。
+  pruneGroupLinks(node, target, prefix, info);
+
+  let missing = 0;
   for (let i = 0; i < cap; i++) {
-    const idx = ensureAutogrowInput(target, prefix, info, i);
-    if (idx === -1) continue;
+    let idx = ensureAutogrowInput(target, prefix, info, i);
+    if (idx === -1) {
+      // 槽还没被前端扩出来。前面若刚好是「同源跳过」，扩张不会被触发，
+      // 这里断开重连一次把前端唤醒；唤醒不了就记补试等下一轮。
+      if (growAutogrowByReconnect(node, target, prefix)) {
+        idx = ensureAutogrowInput(target, prefix, info, i);
+      }
+      if (idx === -1) {
+        missing++;
+        continue;
+      }
+    }
     connectSlot(node, i, target, idx);
   }
 
@@ -743,9 +895,11 @@ function syncOneTarget(node, target, count) {
     const ord = ordinalOfSlot(prefix, info, inp.name);
     if (ord === null || ord < cap) continue;
     const idx = target.inputs.indexOf(inp);
-    if (idx !== -1 && inp.link != null) disconnectSlot(target, idx);
+    // 这里不再用 inp.link != null 预判：脏数据里 link 可能指向别处而槽上仍有孤儿
+    if (idx !== -1) disconnectSlot(target, idx);
   }
 
+  if (missing > 0) markRetry(node);
   target.setDirtyCanvas?.(true, true);
 }
 
@@ -771,20 +925,23 @@ function syncConnections(node) {
   const files = getImageFiles(node);
   if (files.length === 0) {
     // 图片清空 -> 目标节点上所有由本节点提供的连线都断开
+    const graph = node.graph || app.graph;
     const targets = collectTargets(node);
     for (const t of targets) {
       const ag = findImageAutogrow(t);
+      const st = staticCfgOf(t);
       // 快照遍历：断线会让 autogrow 增删末尾槽位，边改边读会漏
       for (const inp of t.inputs?.slice() || []) {
-        if (inp.link == null) continue;
-        const link = getLink(t.graph || app.graph, inp.link);
-        if ((link?.origin_id ?? null) !== node.id) continue;
         const isAutoSlot = ag && isGroupSlot(ag.prefix, inp.name);
-        const st = staticCfgOf(t);
         const isStaticSlot = !!st && st.slotOrder(inp.name) >= 0;
         if (!isAutoSlot && !isStaticSlot) continue;
         const idx = t.inputs.indexOf(inp);
-        if (idx !== -1) disconnectSlot(t, idx);
+        if (idx === -1) continue;
+        // 同样不能靠 inp.link 预判：槽上可能只剩本节点留下的孤儿
+        const mine = linksIntoSlot(graph, t.id, idx).some(
+          (l) => (l.origin_id ?? null) === node.id
+        );
+        if (mine || inp.link != null) disconnectSlot(t, idx);
       }
     }
     // 断线全部处理完，再收敛输出槽（顺序很重要：反了会留悬空 link）
