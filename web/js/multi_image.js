@@ -736,6 +736,237 @@ function pruneGroupLinks(loader, target, prefix, info) {
 }
 
 /**
+ * 掐掉「输出序号 ≠ 槽位序号」的错位连线。
+ *
+ * 这是脏连线最后一条产生路径，也是「切走再切回来就乱连线」留下的残渣：
+ * 前端 autogrow 扩槽时把新槽插在本组末尾，索引里的 link 会被整体 +1 修正，
+ * 但**孤儿 link（索引里查不到的那条）不会被修正**；removeOutput 同理只给
+ * 索引里的 link 做 origin_slot 自减。于是同一条孤儿会慢慢「漂」成别的槽：
+ *   out1 → ref_image_1（正确那条）
+ *   out1 → ref_image_2（孤儿漂过来的，画布上就是「图像_2 冒出两条线」）
+ * 它不违反「一个槽一条线」，所以 pruneGroupLinks 抓不到，
+ * 必须在「输出序号必须等于槽位序号」这条不变量上统一收口。
+ *
+ * 只处理来源是本 loader 的线，别家接进来的线一律不碰。
+ */
+function enforceGroupLinks(loader, target, prefix, info, cap) {
+  const graph = target.graph || app.graph;
+  const links = graph?.links;
+  if (!links) return 0;
+
+  const bad = [];
+  const visit = (l) => {
+    if (!l) return;
+    if ((l.origin_id ?? null) !== loader.id) return;
+    if ((l.target_id ?? null) !== target.id) return;
+    const slot = target.inputs?.[l.target_slot];
+    if (!slot || !isGroupSlot(prefix, slot.name)) return;
+    const ord = ordinalOfSlot(prefix, info, slot.name);
+    if (ord === null) return;
+    // 超出图片数量的槽、以及输出序号与槽位序号对不上的，都是脏线
+    if (ord >= cap || l.origin_slot !== ord) {
+      bad.push({ link: l, ord, out: l.origin_slot, name: slot.name });
+    }
+  };
+  if (typeof links.forEach === "function") {
+    links.forEach((v, k) => visit(v ?? links.get?.(k)));
+  } else {
+    for (const k in links) visit(links[k]);
+  }
+
+  let removed = 0;
+  for (const it of bad) {
+    if (removeLinkHard(graph, it.link)) removed++;
+  }
+  if (removed) {
+    console.warn(
+      `[TaiYangMultiImage] 清理了 ${removed} 条错位连线（输出/槽位序号对不上）`,
+      bad.map((b) => `out${b.out}→${b.name}`).join(", ")
+    );
+    target.setDirtyCanvas?.(true, true);
+  }
+  return removed;
+}
+
+/**
+ * 删掉「来源输出槽已经不存在」的悬空连线。
+ *
+ * syncOutputSlots 是按 outputs[i].links 决定收缩到几个，孤儿不在这个数组里，
+ * 于是可能出现「输出只剩 2 个，graph 里还挂着 out2 的线」。这条线画不出来，
+ * 却会被序列化进工作流，下次打开又变成幽灵。
+ */
+function pruneDanglingOutputLinks(node) {
+  const graph = node.graph || app.graph;
+  const links = graph?.links;
+  if (!links) return 0;
+  const n = (node.outputs || []).length;
+
+  const bad = [];
+  const visit = (l) => {
+    if (!l) return;
+    if ((l.origin_id ?? null) !== node.id) return;
+    if ((l.origin_slot ?? 0) >= n) bad.push(l);
+  };
+  if (typeof links.forEach === "function") {
+    links.forEach((v, k) => visit(v ?? links.get?.(k)));
+  } else {
+    for (const k in links) visit(links[k]);
+  }
+
+  let removed = 0;
+  for (const l of bad) {
+    if (removeLinkHard(graph, l)) removed++;
+  }
+  if (removed) {
+    console.warn(`[TaiYangMultiImage] 清理了 ${removed} 条悬空连线（输出槽已不存在）`);
+  }
+  return removed;
+}
+
+/**
+ * 排查用：把本节点与各目标之间的所有连线（含孤儿）打出来。
+ * 控制台执行 __tyAuditImageLinks() 即可；连线出问题时把输出发出来就能定位。
+ */
+function auditImageLinks() {
+  const g = app?.graph;
+  if (!g) return "no graph";
+  const rows = [];
+  const all = typeof g.links?.values === "function" ? [...g.links.values()] : [];
+  for (const n of g._nodes || []) {
+    if (n.type !== NODE_NAME) continue;
+    rows.push(`多图载入 #${n.id}：图片 ${getImageFiles(n).length} 张，输出槽 ${(n.outputs || []).length} 个`);
+    for (const t of collectTargets(n)) {
+      const ag = findImageAutogrow(t);
+      rows.push(`  目标 #${t.id}（${t.type}）组=${ag?.prefix ?? "(无)"}`);
+      const mine = all.filter((l) => l.origin_id === n.id && l.target_id === t.id);
+      if (!mine.length) rows.push("    （无连线）");
+      for (const l of mine) {
+        const slot = t.inputs?.[l.target_slot];
+        const ord = ag && slot ? ordinalOfSlot(ag.prefix, ag.info, slot.name) : null;
+        const bad = ord !== null && ord !== l.origin_slot ? "   ← 错位" : "";
+        rows.push(`    out${l.origin_slot} → [${l.target_slot}] ${slot?.name ?? "?"} 序号=${ord}${bad}`);
+      }
+    }
+  }
+  const text = rows.join("\n") || "没有多图载入节点";
+  console.log(text);
+  return text;
+}
+
+// ---------------------------------------------------------------- 载入期保护 + 载入后收口
+//
+// 「切走再切回来就乱连线」的真正成因（用户实测：什么都没动）：
+//
+//   切标签页 = 前端走一次 loadGraphData -> 把整张图拆掉重建。
+//   重建时节点是一个一个 configure 的：本节点的 onConfigure 会先跑，
+//   而对端节点（H3 那种带 autogrow 的大节点）此时还没 configure 完、
+//   graph.links 也还没把存档里的线恢复回来。
+//   我们在这个「半成品的图」上跑 syncConnections -> 建链成功；
+//   紧接着前端继续 configure，把存档里原本正确的线也恢复回来
+//   -> 同一个输入槽上就有了两条线 -> 画布上看着就是「图像_2 冒出两条线」。
+//
+// 所以：载入期间一律不建链、不拆线，只记个标记；等
+// afterConfigureGraph 之后再做一次收口（清理 + 补齐）。
+// 存档本来是干净的，收口就没有任何动作，图形保持原样。
+
+let graphLoadDepth = 0;
+let loadWatchdog = null;
+
+/** 图是不是正在载入/重建中 */
+function graphBusy() {
+  return graphLoadDepth > 0;
+}
+
+function beginGraphLoad() {
+  graphLoadDepth++;
+  if (loadWatchdog) clearTimeout(loadWatchdog);
+  // 兜底：万一 afterConfigureGraph 没来（被别的扩展打断 / 抛异常），
+  // 别把保护状态永久挂着，否则之后所有自动连线都会失效。
+  loadWatchdog = setTimeout(() => {
+    loadWatchdog = null;
+    if (graphLoadDepth > 0) {
+      console.warn("[TaiYangMultiImage] 未收到载入结束信号，强制解除载入保护");
+      graphLoadDepth = 0;
+    }
+    scheduleSettle();
+  }, 15000);
+}
+
+function endGraphLoad() {
+  graphLoadDepth = Math.max(0, graphLoadDepth - 1);
+  if (graphLoadDepth === 0) {
+    if (loadWatchdog) {
+      clearTimeout(loadWatchdog);
+      loadWatchdog = null;
+    }
+    scheduleSettle();
+  }
+}
+
+let settleTimer = null;
+let settlePass = 0;
+
+/**
+ * 载入结束后的收口：清理脏线 + 按需补齐。
+ * 跑四轮（50ms / 310ms / 1.2s / 3.4s），因为 autogrow 扩槽、以及别的扩展
+ * 对输入的二次加工都可能在我们之后发生，一轮不够稳。
+ */
+function scheduleSettle() {
+  if (settleTimer) clearTimeout(settleTimer);
+  settlePass = 0;
+  const NEXT = [260, 900, 2200];
+  const step = () => {
+    settleTimer = null;
+    if (graphBusy()) return;          // 又开始了新一轮载入，等它结束
+    const g = app?.graph;
+    if (!g) return;
+    for (const n of g._nodes || []) {
+      if (n.type !== NODE_NAME) continue;
+      try {
+        settleLoader(n);
+      } catch (e) {
+        console.warn("[TaiYangMultiImage] 载入后收口失败", e);
+      }
+    }
+    settlePass++;
+    if (settlePass < NEXT.length + 1) {
+      settleTimer = setTimeout(step, NEXT[settlePass - 1] ?? 900);
+    }
+  };
+  settleTimer = setTimeout(step, 50);
+}
+
+/**
+ * 单个 loader 的收口：先清脏线，再补齐缺的槽，补完再核一遍。
+ *
+ * 补连之后再核一遍的原因：autogrow 扩槽会把新槽插进 inputs 中间，
+ * 索引里的 link 会被前端顺手修正，孤儿的 target_slot 却不会 ——
+ * 也就是说「补线这个动作本身」也可能当场漂出一条错位线。
+ */
+function settleLoader(node) {
+  const graph = node.graph || app.graph;
+  if (!graph) return;
+  if (!(graph._nodes || []).includes(node)) return;   // 节点已经被删 / 换图了
+
+  const files = getImageFiles(node);
+  const sweep = () => {
+    for (const t of collectTargets(node)) {
+      const ag = findImageAutogrow(t);
+      if (!ag) continue;
+      const cap = Math.min(files.length, ag.info?.max ?? MAX_IMAGES, MAX_IMAGES);
+      enforceGroupLinks(node, t, ag.prefix, ag.info, cap);
+    }
+    pruneDanglingOutputLinks(node);
+  };
+
+  sweep();
+  if (files.length === 0) return;
+  // 图已经完整就绪，这时候补连不会重复（同源的线 connectSlot 会直接跳过）
+  syncConnections(node, { force: true });
+  sweep();
+}
+
+/**
  * 建链。优先用节点级 connect(outSlot, targetNode, inputSlot)，
  * 它是前端对外的正规入口，内部会转调 connectSlots 完成
  * link id 分配 / graph.links 写入 / 两侧 slot 更新 /
@@ -921,7 +1152,14 @@ function ordinalOfSlot(groupPrefix, info, fullName) {
 }
 
 /** 把本节点的图片按顺序连到目标节点 */
-function syncConnections(node) {
+function syncConnections(node, opts = {}) {
+  // 载入/重建期间不许建链：这时候图是半成品，建出来的线会和
+  // 前端稍后恢复的存档连线叠在一起（详见上面「载入期保护」的说明）。
+  // 记一笔，等 afterConfigureGraph 之后的收口统一处理。
+  if (!opts.force && graphBusy()) {
+    node.__tyNeedSettle = true;
+    return;
+  }
   const files = getImageFiles(node);
   if (files.length === 0) {
     // 图片清空 -> 目标节点上所有由本节点提供的连线都断开
@@ -975,6 +1213,12 @@ function syncConnections(node) {
 function syncAllLoaders() {
   const graph = app.graph;
   if (!graph) return;
+  // 载入期一律不动：新建的其实是「正在被 configure 的存档节点」，
+  // 这时候接线会和随后恢复的存档连线重复
+  if (graphBusy()) {
+    scheduleSettle();
+    return;
+  }
   for (const n of graph._nodes || []) {
     if (n.type !== NODE_NAME) continue;
     if (getImageFiles(n).length === 0) continue;
@@ -1001,6 +1245,13 @@ function markRetry(node) {
     const g = app?.graph;
     if (!g || !(g._nodes || []).includes(node)) return;
     if (getImageFiles(node).length === 0) return;
+    // 补试正好撞上「又切了一次工作流」：别在这里接线（会重复），
+    // 把次数还回去，改由载入结束后的收口统一处理
+    if (graphBusy()) {
+      node._retryCount = Math.max(0, n - 1);
+      scheduleSettle();
+      return;
+    }
     syncConnections(node);
   }, RETRY_DELAYS[n - 1] || RETRY_DELAYS[RETRY_DELAYS.length - 1]);
 }
@@ -1026,6 +1277,23 @@ async function uploadOne(file) {
 
 app.registerExtension({
   name: "ComfyUI.TaiYangMultiImageLoader",
+
+  // 工作流载入（含切标签页、撤销、导入）会用 loadGraphData 把整张图拆掉重建。
+  // 这一对钩子是前端唯二能覆盖「从头到尾」的时机：
+  //   beforeConfigureGraph -> 打上「在载入」标记，期间禁止一切建链/断线
+  //   afterConfigureGraph  -> 载入完成，做收口（清脏线 + 按需补线）
+  beforeConfigureGraph() {
+    beginGraphLoad();
+  },
+
+  afterConfigureGraph() {
+    endGraphLoad();
+  },
+
+  setup() {
+    // 排查入口：控制台执行 __tyAuditImageLinks() 打印全部连线（含孤儿/错位）
+    window.__tyAuditImageLinks = auditImageLinks;
+  },
 
   async beforeRegisterNodeDef(nodeType, nodeData) {
     // 目标节点：新建时反向触发一次连线。
@@ -1130,8 +1398,14 @@ app.registerExtension({
 
       // 载入工作流时按图片数收敛输出槽。
       // 下限取「已连线的输出数」，避免把工作流里存着的有效连线给剪掉。
-      const linkedCount = (this.outputs || []).filter((o) => (o.links || []).length > 0).length;
-      syncOutputSlots(this, Math.max(files.length, linkedCount));
+      //
+      // 载入期跳过：这时候 outputs[i].links 还是空的（link 尚未恢复），
+      // linkedCount 数不准，贸然 removeOutput 会把还没恢复的存档连线一起删掉。
+      // 输出槽的收敛交给载入后的收口（settleLoader -> syncConnections）。
+      if (!graphBusy()) {
+        const linkedCount = (this.outputs || []).filter((o) => (o.links || []).length > 0).length;
+        syncOutputSlots(this, Math.max(files.length, linkedCount));
+      }
 
       // 老工作流可能存着过窄的宽度（没留输出槽标签的位置），这里强制拉齐宽度，
       // 否则载入后右侧标签仍会压在图片上。
@@ -1142,12 +1416,18 @@ app.registerExtension({
       this.setDirtyCanvas?.(true, true);
 
       // 载入后按已保存的连线重建一次缺失的槽位。
-      // 不能只跑一次：工作流刚打开时对端节点（尤其第三方节点）的输入槽
-      // 可能还没初始化完，那一轮会找不到目标槽而静默跳过。
-      // 所以这里也走 markRetry —— 由它按 120ms/400ms/1s/2.2s/4s 补试，
-      // 连上即停，不会无限重试。
+      //
+      // 但**载入期绝对不许动**：切标签页会走 loadGraphData 把整张图拆了重建，
+      // 此时对端节点还没 configure 完、存档里的线也还没恢复回来，
+      // 在这里建链 -> 稍后前端又把存档的线恢复一遍 -> 同一个槽两条线，
+      // 就是「本来对的，切走再切回来就乱了」。所以载入期只打标记，
+      // 由 afterConfigureGraph 之后的收口统一处理（清脏线 + 补缺失）。
       this._retryCount = 0;
-      syncConnections(this);
+      if (graphBusy()) {
+        this.__tyNeedSettle = true;
+      } else {
+        syncConnections(this);
+      }
       return r;
     };
 
@@ -1991,4 +2271,12 @@ export {
   syncConnections,
   reorderList,
   scaledSize,
+  // 载入期保护与收口（测试需要直接驱动）
+  beginGraphLoad,
+  endGraphLoad,
+  graphBusy,
+  scheduleSettle,
+  settleLoader,
+  enforceGroupLinks,
+  pruneDanglingOutputLinks,
 };

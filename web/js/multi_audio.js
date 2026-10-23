@@ -1040,6 +1040,169 @@ function pruneGroupLinks(loader, target, prefix, info) {
 }
 
 /**
+ * 掐掉「输出序号 ≠ 槽位序号」的错位连线（多图载入那边同一个坑，说明见那边）。
+ *
+ * 孤儿 link 不会被前端 autogrow 扩槽 / removeOutput 的槽位修正同步更新，
+ * 于是会「漂」成别的槽：out1 → ref_audio_1（正确）+ out1 → ref_audio_2（孤儿）。
+ * 一个槽一条线，pruneGroupLinks 抓不到，必须按不变量统一收口。
+ */
+function enforceGroupLinks(loader, target, prefix, info, cap) {
+  const graph = target.graph || app.graph;
+  const links = graph?.links;
+  if (!links) return 0;
+
+  const bad = [];
+  const visit = (l) => {
+    if (!l) return;
+    if ((l.origin_id ?? null) !== loader.id) return;
+    if ((l.target_id ?? null) !== target.id) return;
+    const slot = target.inputs?.[l.target_slot];
+    if (!slot || !isGroupSlot(prefix, slot.name)) return;
+    const ord = ordinalOfSlot(prefix, info, slot.name);
+    if (ord === null) return;
+    if (ord >= cap || l.origin_slot !== ord) {
+      bad.push({ link: l, ord, out: l.origin_slot, name: slot.name });
+    }
+  };
+  if (typeof links.forEach === "function") {
+    links.forEach((v, k) => visit(v ?? links.get?.(k)));
+  } else {
+    for (const k in links) visit(links[k]);
+  }
+
+  let removed = 0;
+  for (const it of bad) {
+    if (removeLinkHard(graph, it.link)) removed++;
+  }
+  if (removed) {
+    console.warn(
+      `[TaiYangMultiAudio] 清理了 ${removed} 条错位连线（输出/槽位序号对不上）`,
+      bad.map((b) => `out${b.out}→${b.name}`).join(", ")
+    );
+    target.setDirtyCanvas?.(true, true);
+  }
+  return removed;
+}
+
+/** 删掉「来源输出槽已经不存在」的悬空连线 */
+function pruneDanglingOutputLinks(node) {
+  const graph = node.graph || app.graph;
+  const links = graph?.links;
+  if (!links) return 0;
+  const n = (node.outputs || []).length;
+
+  const bad = [];
+  const visit = (l) => {
+    if (!l) return;
+    if ((l.origin_id ?? null) !== node.id) return;
+    if ((l.origin_slot ?? 0) >= n) bad.push(l);
+  };
+  if (typeof links.forEach === "function") {
+    links.forEach((v, k) => visit(v ?? links.get?.(k)));
+  } else {
+    for (const k in links) visit(links[k]);
+  }
+
+  let removed = 0;
+  for (const l of bad) {
+    if (removeLinkHard(graph, l)) removed++;
+  }
+  if (removed) {
+    console.warn(`[TaiYangMultiAudio] 清理了 ${removed} 条悬空连线（输出槽已不存在）`);
+  }
+  return removed;
+}
+
+// ---------------------------------------------------------------- 载入期保护 + 载入后收口
+//
+// 「切走再切回来就乱连线」：切标签页会走 loadGraphData 重建整张图，
+// 重建时本节点 onConfigure 先跑、对端还没 configure 完、存档连线也还没恢复，
+// 这时候建链，等前端稍后把存档的线恢复回来，同一个槽就有两条线了。
+// 载入期一律不动，载入结束再收口。（多图载入那边有完整说明）
+
+let graphLoadDepth = 0;
+let loadWatchdog = null;
+
+function graphBusy() {
+  return graphLoadDepth > 0;
+}
+
+function beginGraphLoad() {
+  graphLoadDepth++;
+  if (loadWatchdog) clearTimeout(loadWatchdog);
+  loadWatchdog = setTimeout(() => {
+    loadWatchdog = null;
+    if (graphLoadDepth > 0) {
+      console.warn("[TaiYangMultiAudio] 未收到载入结束信号，强制解除载入保护");
+      graphLoadDepth = 0;
+    }
+    scheduleSettle();
+  }, 15000);
+}
+
+function endGraphLoad() {
+  graphLoadDepth = Math.max(0, graphLoadDepth - 1);
+  if (graphLoadDepth === 0) {
+    if (loadWatchdog) {
+      clearTimeout(loadWatchdog);
+      loadWatchdog = null;
+    }
+    scheduleSettle();
+  }
+}
+
+let settleTimer = null;
+let settlePass = 0;
+
+function scheduleSettle() {
+  if (settleTimer) clearTimeout(settleTimer);
+  settlePass = 0;
+  const NEXT = [260, 900, 2200];
+  const step = () => {
+    settleTimer = null;
+    if (graphBusy()) return;
+    const g = app?.graph;
+    if (!g) return;
+    for (const n of g._nodes || []) {
+      if (n.type !== NODE_NAME) continue;
+      try {
+        settleLoader(n);
+      } catch (e) {
+        console.warn("[TaiYangMultiAudio] 载入后收口失败", e);
+      }
+    }
+    settlePass++;
+    if (settlePass < NEXT.length + 1) {
+      settleTimer = setTimeout(step, NEXT[settlePass - 1] ?? 900);
+    }
+  };
+  settleTimer = setTimeout(step, 50);
+}
+
+/** 先清脏线，再补齐缺的槽，补完再核一遍（补线本身也可能漂出错位线） */
+function settleLoader(node) {
+  const graph = node.graph || app.graph;
+  if (!graph) return;
+  if (!(graph._nodes || []).includes(node)) return;
+
+  const files = getAudioFiles(node);
+  const sweep = () => {
+    for (const t of collectTargets(node)) {
+      const ag = findAudioAutogrow(t);
+      if (!ag) continue;
+      const cap = Math.min(files.length, ag.info?.max ?? MAX_AUDIOS, MAX_AUDIOS);
+      enforceGroupLinks(node, t, ag.prefix, ag.info, cap);
+    }
+    pruneDanglingOutputLinks(node);
+  };
+
+  sweep();
+  if (files.length === 0) return;
+  syncConnections(node, { force: true });
+  sweep();
+}
+
+/**
  * 建链。优先用节点级 connect(outSlot, targetNode, inputSlot)，
  * 它内部会处理 link id 分配 / graph.links 写入 / 两侧 slot 更新 /
  * beforeChange+afterChange / 脏画布 / autogrow 的 onConnectionsChange。
@@ -1203,7 +1366,12 @@ function ordinalOfSlot(groupPrefix, info, fullName) {
 }
 
 /** 把本节点的音频按顺序连到目标节点 */
-function syncConnections(node) {
+function syncConnections(node, opts = {}) {
+  // 载入/重建期间不许建链（会与随后恢复的存档连线重复），只打标记等收口
+  if (!opts.force && graphBusy()) {
+    node.__tyNeedSettle = true;
+    return;
+  }
   const files = getAudioFiles(node);
   if (files.length === 0) {
     const graph = node.graph || app.graph;
@@ -1244,6 +1412,12 @@ function syncConnections(node) {
 function syncAllLoaders() {
   const graph = app.graph;
   if (!graph) return;
+  // 载入期不动：新建的其实是「正在被 configure 的存档节点」，
+  // 这时接线会和随后恢复的存档连线重复
+  if (graphBusy()) {
+    scheduleSettle();
+    return;
+  }
   for (const n of graph._nodes || []) {
     if (n.type !== NODE_NAME) continue;
     if (getAudioFiles(n).length === 0) continue;
@@ -1269,6 +1443,16 @@ async function uploadOne(file) {
 
 app.registerExtension({
   name: "ComfyUI.TaiYangMultiAudioLoader",
+
+  // 工作流载入（含切标签页）会重建整张图，这一对钩子覆盖「从头到尾」：
+  // 载入期禁建链，载入结束再收口（清脏线 + 补缺失）
+  beforeConfigureGraph() {
+    beginGraphLoad();
+  },
+
+  afterConfigureGraph() {
+    endGraphLoad();
+  },
 
   async beforeRegisterNodeDef(nodeType, nodeData) {
     // 目标节点：新建时反向触发一次连线（注册期拿不到实例的 autogrow 定义，
@@ -1358,8 +1542,12 @@ app.registerExtension({
       // 读精确时长（解码），画竖线要用；不先读 metadata（估算不准）
       (this._audios || []).forEach((n) => getAudioBuffer(this, n));
 
-      const linkedCount = (this.outputs || []).filter((o) => (o.links || []).length > 0).length;
-      syncOutputSlots(this, Math.max(this._audios.length, linkedCount));
+      // 载入期跳过输出槽收敛：这时 outputs[i].links 还是空的（link 未恢复），
+      // linkedCount 数不准，removeOutput 会把还没恢复的存档连线一起删掉
+      if (!graphBusy()) {
+        const linkedCount = (this.outputs || []).filter((o) => (o.links || []).length > 0).length;
+        syncOutputSlots(this, Math.max(this._audios.length, linkedCount));
+      }
 
       // 老工作流可能存着过窄的宽度，这里强制拉齐宽度；
       // 高度不按 NODE_H 拉满——最小高度是动态的（按已用行数），
@@ -1368,7 +1556,12 @@ app.registerExtension({
       if (this.size[0] < NODE_W) this.size[0] = NODE_W;
       this.setDirtyCanvas?.(true, true);
 
-      setTimeout(() => syncConnections(this), 0);
+      // 载入期不建链（会和随后恢复的存档连线重复），只打标记等收口
+      if (graphBusy()) {
+        this.__tyNeedSettle = true;
+      } else {
+        setTimeout(() => syncConnections(this), 0);
+      }
       return r;
     };
 
@@ -2291,4 +2484,12 @@ export {
   formatRulerSec,
   syncConnections,
   reorderList,
+  // 载入期保护与收口（测试需要直接驱动）
+  beginGraphLoad,
+  endGraphLoad,
+  graphBusy,
+  scheduleSettle,
+  settleLoader,
+  enforceGroupLinks,
+  pruneDanglingOutputLinks,
 };
