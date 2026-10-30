@@ -83,7 +83,11 @@ function ensureStyle() {
   border-radius: 6px; background: #0f1013; overflow: hidden;
   box-shadow: inset 0 0 0 1px #2b2e35;
 }
-.ty-mi-cell img { width: 100%; height: 100%; object-fit: cover; display: block; }
+/* contain 而不是 cover：竖图/宽图都要整张看得见（cover 会把两边裁掉） */
+.ty-mi-cell img {
+  width: 100%; height: 100%; object-fit: contain; object-position: center;
+  display: block; background: #0f1013;
+}
 .ty-mi-cell.has { cursor: grab; }
 .ty-mi-cell.has:active { cursor: grabbing; }
 .ty-mi-cell.empty { background: #121316; box-shadow: inset 0 0 0 1px #24262c; }

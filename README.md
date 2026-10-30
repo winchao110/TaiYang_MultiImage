@@ -47,6 +47,8 @@
   不是画在 canvas 上。所以 Node 2.0（Vue 节点）和旧版 LiteGraph 两种渲染都正常显示
 - **业务逻辑**：`web/js/multi_image.js` 只管自动连线、输出槽、上传、解码；
   `web/js/multi_image_dom.js` 只负责界面。逻辑**只有一份**，两个文件互相 import 复用
+- **缩略图完整显示**：格子里用 `object-fit: contain`，竖图 / 宽图都整张看得见，
+  不会被裁成正方形（画布自绘模式同样按 contain 绘制，并给底部尺寸条让位）
 - **缩放**：内置 ComfyUI `Scale Image to Total Pixels` 的那套算法（按总像素数等比缩放，
   宽高再对齐到指定步长），不裁剪、不变形
 - **自动连线**：扫描画布上带 `images` / `ref_images` autogrow 组的节点，
