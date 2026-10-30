@@ -949,6 +949,15 @@ function settleLoader(node) {
   if (!(graph._nodes || []).includes(node)) return;   // 节点已经被删 / 换图了
 
   const files = getImageFiles(node);
+
+  // 自动连线关着：收口只清悬空 link，绝不补线、也不碰对端槽位 ——
+  // 用户既然改手动了，载入工作流时把他手拉的线改掉是最难受的。
+  if (getMode(node) === MODE_OFF) {
+    pruneDanglingOutputLinks(node);
+    syncOutputSlots(node, files.length);
+    return;
+  }
+
   const sweep = () => {
     for (const t of collectTargets(node)) {
       const ag = findImageAutogrow(t);
@@ -1161,6 +1170,17 @@ function syncConnections(node, opts = {}) {
     return;
   }
   const files = getImageFiles(node);
+
+  // 自动连线被关掉（开关 / 下拉选了「关闭」）：一根线都不许碰。
+  // 此时既不能建链，也不能走下面「图片为空就断线」的分支 ——
+  // 关掉自动连线的人就是要手动拉线，之前手连的线必须原样留着。
+  // 输出槽仍然跟着图片数走，不然删图后槽位会残留。
+  if (getMode(node) === MODE_OFF) {
+    syncOutputSlots(node, files.length);
+    clearRetry(node);
+    return;
+  }
+
   if (files.length === 0) {
     // 图片清空 -> 目标节点上所有由本节点提供的连线都断开
     const graph = node.graph || app.graph;
@@ -1207,6 +1227,87 @@ function syncConnections(node, opts = {}) {
   if ((node._retryCount || 0) === before) clearRetry(node);
   // 收尾统一调整输出槽数量：几张图就显示几个 image_N
   syncOutputSlots(node, files.length);
+}
+
+// ---------------------------------------------------------------- 自动连线开关
+// 节点顶部的「关闭自动连线 / 开启自动连线」按钮就是这三个函数。
+// 状态本身存在 auto_link 这个 combo 里（值 = MODE_OFF 即关闭），
+// 所以随工作流一起存档，重开还是关着。
+
+/** 写 auto_link 下拉值。后端是 combo，必须写**字符串**，写索引会校验失败 */
+function setAutoLink(node, idx) {
+  const w = getWidget(node, "auto_link");
+  if (!w) return false;
+  w.value = MODE_OPTIONS[idx] ?? MODE_OPTIONS[0];
+  node.setDirtyCanvas?.(true, true);
+  return true;
+}
+
+/**
+ * 断开本节点输出端的所有连线（下游槽位留着，方便用户接手手动连）。
+ *
+ * 不能直接 graph.removeLink 完事：
+ *   - 目标槽上可能只剩孤儿对象（inputs[slot].link 指错地方），官方入口删不干净；
+ *   - autogrow 在断线时会顺手删掉末尾空槽，边遍历边断会让后面的槽号错位。
+ * 所以先按「目标节点 + 槽号」收集，再按槽号**从大到小**统一走 disconnectSlot。
+ */
+function disconnectAllOutputs(node) {
+  const graph = node.graph || app.graph;
+  if (!graph) return 0;
+
+  const byTarget = new Map();   // targetId -> { target, slots:Set }
+  for (const out of node.outputs || []) {
+    for (const lid of (out.links || []).slice()) {
+      const link = getLink(graph, lid);
+      if (!link) continue;
+      const tid = targetIdOf(link);
+      const slot = link.target_slot;
+      if (tid == null || slot == null || slot < 0) continue;
+      const target = graph.getNodeById?.(tid)
+        || (graph._nodes || []).find((n) => n.id === tid);
+      if (!target) continue;
+      let rec = byTarget.get(tid);
+      if (!rec) byTarget.set(tid, (rec = { target, slots: new Set() }));
+      rec.slots.add(slot);
+    }
+  }
+
+  let n = 0;
+  for (const { target, slots } of byTarget.values()) {
+    for (const slot of [...slots].sort((a, b) => b - a)) {
+      // 断之前再确认这条槽上确实还有本节点的线（上一刀可能已经连带清掉）
+      const stillMine = linksIntoSlot(graph, target.id, slot).some(
+        (l) => (l.origin_id ?? null) === node.id
+      );
+      if (!stillMine) continue;
+      disconnectSlot(target, slot);
+      n++;
+    }
+    target.setDirtyCanvas?.(true, true);
+  }
+
+  // 断干净了再收敛输出槽，否则 removeOutput 会先删 link
+  syncOutputSlots(node, getImageFiles(node).length);
+  node.setDirtyCanvas?.(true, true);
+  return n;
+}
+
+/** 开/关自动连线。返回切换后的状态（true = 自动连线开着） */
+function toggleAutoLink(node) {
+  const on = getMode(node) !== MODE_OFF;
+  if (on) {
+    // 先切模式再断线：反过来的话断线过程里任何一次 syncConnections
+    // 都会立刻把线接回去，等于没关。
+    setAutoLink(node, MODE_OFF);
+    const cut = disconnectAllOutputs(node);
+    console.log(`[TaiYangMultiImage] 自动连线已关闭，断开 ${cut} 根线（改手动连线）`);
+    return false;
+  }
+  setAutoLink(node, MODE_AUTO);
+  // 手动指定过目标就照旧连回那个目标；没有就走自动发现
+  syncConnections(node, { force: true });
+  console.log("[TaiYangMultiImage] 自动连线已开启");
+  return true;
 }
 
 /** 目标节点刚被创建时，反向把已有图片接上去 */
@@ -1492,9 +1593,11 @@ app.registerExtension({
       ];
 
       items.push({
-        content: "🔗 重新自动连线",
+        // 关着自动连线时点这个：顺手把开关打开，不然点了一点反应都没有
+        content: getMode(this) === MODE_OFF ? "🔗 开启自动连线并重连" : "🔗 重新自动连线",
         callback: () => {
-          syncConnections(this);
+          if (getMode(this) === MODE_OFF) setAutoLink(this, MODE_AUTO);
+          syncConnections(this, { force: true });
           this.setDirtyCanvas(true, true);
         },
       });
@@ -2169,17 +2272,13 @@ const editScale = function (node, zone) {
         return true;
       }
 
-      // 底部模式条：左键在「自动 / 关闭」间切换；有手动目标时先清掉手动目标
+      // 底部模式条：左键在「自动 / 关闭」间切换（与 DOM 面板顶部按钮同一套逻辑）
       if (barAt(this, pos)) {
         if (this._qwenManualTarget) {
           this._qwenManualTarget = null;
           if (this.properties) delete this.properties.auto_link_target;
-        } else {
-          const w = getWidget(this, "auto_link");
-          if (w) w.value = getMode(this) === MODE_OFF ? MODE_AUTO : MODE_OFF;
         }
-        syncConnections(this);
-        this.setDirtyCanvas(true, true);
+        toggleAutoLink(this);
         return true;
       }
 
@@ -2271,6 +2370,12 @@ export {
   syncConnections,
   reorderList,
   scaledSize,
+  // 自动连线开关（顶部按钮 / 自绘模式条共用）
+  MODE_AUTO,
+  MODE_OFF,
+  setAutoLink,
+  disconnectAllOutputs,
+  toggleAutoLink,
   // 载入期保护与收口（测试需要直接驱动）
   beginGraphLoad,
   endGraphLoad,

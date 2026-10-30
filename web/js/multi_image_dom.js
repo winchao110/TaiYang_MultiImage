@@ -34,6 +34,9 @@ import {
   syncConnections,
   reorderList,
   scaledSize,
+  MODE_OFF,
+  toggleAutoLink,
+  disconnectAllOutputs,
 } from "./multi_image.js";
 
 const NODE_NAME = "TaiYangMultiImageLoader";
@@ -146,6 +149,17 @@ function ensureStyle() {
 .ty-mi-btn.pri { border-color: #35506a; color: #b9ddf6; }
 .ty-mi-btn.pri:hover { border-color: #3f6f95; background: #1d2a36; color: #d7ecff; }
 .ty-mi-btn.danger:hover { border-color: #7a3d47; color: #f2c3c9; }
+/* 顶部「关闭 / 开启自动连线」开关：开着时是蓝边，关掉后转橙，一眼能看出状态 */
+.ty-mi-auto {
+  border-color: #35506a; color: #b9ddf6;
+  height: 22px; padding: 0 7px; font-size: 10.5px;
+  display: inline-flex; align-items: center; gap: 5px;
+}
+.ty-mi-auto:hover { border-color: #3f6f95; background: #1d2a36; color: #d7ecff; }
+.ty-mi-auto .dot { width: 6px; height: 6px; border-radius: 50%; background: #6fd06f; }
+.ty-mi-auto.off { border-color: #6b5636; color: #ffc98a; }
+.ty-mi-auto.off:hover { border-color: #8a6d42; background: #2a2318; color: #ffdba8; }
+.ty-mi-auto.off .dot { background: #e0a44a; }
 `;
   document.head.appendChild(s);
 }
@@ -194,6 +208,9 @@ function build(node) {
       <span class="ty-mi-title">参考图</span>
       <span class="ty-mi-link"></span>
       <span class="ty-mi-spacer"></span>
+      <button type="button" class="ty-mi-btn ty-mi-auto" title="关闭后本节点不再自动连线，改由手动拉线">
+        <span class="dot"></span><span class="ty-mi-auto-txt">关闭自动连线</span>
+      </button>
       <button type="button" class="ty-mi-btn danger ty-mi-clear">清空</button>
     </div>
     <div class="ty-mi-grid"></div>
@@ -216,6 +233,8 @@ function build(node) {
     root,
     title: root.querySelector(".ty-mi-title"),
     link: root.querySelector(".ty-mi-link"),
+    auto: root.querySelector(".ty-mi-auto"),
+    autoTxt: root.querySelector(".ty-mi-auto-txt"),
     clear: root.querySelector(".ty-mi-clear"),
     grid: root.querySelector(".ty-mi-grid"),
     mp: root.querySelector(".ty-mi-mp"),
@@ -299,6 +318,16 @@ function build(node) {
   el.add.addEventListener("click", () => {
     if (getImageFiles(node).length >= MAX_IMAGES) return;
     pickFiles();
+  });
+
+  // 顶部开关：关闭 = 断开本节点已连出去的线，之后只有手动拉线；
+  // 再点一下 = 恢复自动连线，按当前图片重新接一遍。
+  el.auto.addEventListener("click", (e) => {
+    e.stopPropagation();
+    toggleAutoLink(node);
+    refresh(node, false);
+    // 连线数变了，签名立刻对齐，免得轮询下一拍又触发一次重建
+    node.__tyMiSig = signature(node);
   });
   el.clear.addEventListener("click", () => {
     if (!getImageFiles(node).length) return;
@@ -426,8 +455,11 @@ function build(node) {
     }
     const w = getWidget(node, "auto_link");
     // 写**字符串**：后端是 combo，收索引会校验失败
-    if (w) w.value = MODE_OPTIONS[Number(el.mode.value)] ?? MODE_OPTIONS[0];
-    syncConnections(node);
+    const idx = Number(el.mode.value);
+    if (w) w.value = MODE_OPTIONS[idx] ?? MODE_OPTIONS[0];
+    // 下拉选「关闭」和点顶部开关是一个意思：已连的线断干净，改手动
+    if (idx === MODE_OFF) disconnectAllOutputs(node);
+    else syncConnections(node);
     refresh(node, false);
   });
 
@@ -443,15 +475,34 @@ function refresh(node, full = true) {
   if (!el) return;
   const files = getImageFiles(node);
   const linked = linkedCount(node);
+  const off = getMode(node) === MODE_OFF;
 
   el.title.textContent = `参考图 ${files.length}/${MAX_IMAGES}`;
-  el.link.textContent = files.length === 0
-    ? "还没有图片，点「添加」或把图片拖进来"
-    : linked >= files.length
-      ? `✓ 已连接${node._qwenManualTarget ? " " + node._qwenManualTarget : ""}`
-      : `还有 ${files.length - linked} 张未连接`;
-  el.link.className = "ty-mi-link"
-    + (files.length === 0 ? "" : linked >= files.length ? " ok" : " warn");
+  if (off) {
+    // 关掉自动连线以后就别再报「还有 N 张未连接」了 —— 那是自动连线的口径，
+    // 手动连线时本来就轮不到它管，报出来只会让人以为出了错。
+    el.link.textContent = files.length === 0
+      ? "自动连线已关闭 · 先加图片"
+      : "自动连线已关闭 · 请手动拉线";
+    el.link.className = "ty-mi-link";
+  } else {
+    el.link.textContent = files.length === 0
+      ? "还没有图片，点「添加」或把图片拖进来"
+      : linked >= files.length
+        ? `✓ 已连接${node._qwenManualTarget ? " " + node._qwenManualTarget : ""}`
+        : `还有 ${files.length - linked} 张未连接`;
+    el.link.className = "ty-mi-link"
+      + (files.length === 0 ? "" : linked >= files.length ? " ok" : " warn");
+  }
+
+  // 开关文案与配色跟着状态走；初始（auto_link=自动）就是「关闭自动连线」
+  if (el.autoTxt) el.autoTxt.textContent = off ? "开启自动连线" : "关闭自动连线";
+  el.auto?.classList.toggle("off", off);
+  if (el.auto) {
+    el.auto.title = off
+      ? "点一下恢复自动连线，按当前图片接回下游"
+      : "关闭后本节点不再自动连线，已连的线会断开，改由手动拉线";
+  }
 
   if (full) {
     const slots = Math.min(MAX_IMAGES, Math.max(COLS, Math.ceil((files.length + 1) / COLS) * COLS));
