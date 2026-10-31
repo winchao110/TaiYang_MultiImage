@@ -46,9 +46,11 @@ class TaiYangH3FP16Turbo:
         "残差流（attention sink 行会涨到 ~4.3M）、out_proj/fc2 输出（2M 以上）。"
         "处理方式是残差流用 FP32、投影前后乘以 2 的幂（out_proj 64、fc2 256），"
         "因为投影是线性的，这个缩放是精确的，只挪指数范围，不损失精度。\n"
-        "量化权重也可切「全部不转」：连 fp32/bf16 都不动，权重直接进 "
-        "comfy_kitchen 的 int8 GEMM（RTX 2080Ti 实测 int8 比 FP16 快约 1.7 倍，"
-        "qkv 8192 token：int8 13.8ms / fp16 23.4ms；FP16 那侧胜在激活不做 int8 量化）。"
+        "「量化权重」有两档：默认的「BF16,FP32转为FP16」只换非量化权重，"
+        "int8/int4 仍以 int8 存储、前向那一瞬间才反量化，显存占用不变；"
+        "「全部权重转为FP16」会把 int8/int4 也 dequantize 成稠密 FP16，"
+        "权重占用约翻倍（H3 约 20GB → 40GB），24GB 卡选它一定 OOM，"
+        "只有大显存、或内存充足能 offload 的机器才吃得下。"
         "计算精度也可切 BF16（本来就快 bf16 的卡上它才是首选；没有 bf16 张量核的卡上"
         "会走模拟，最慢，仅在排查问题时用）。\n"
         "接法：模型 → 本节点 → 显存分块加载 / 注意力加速。本节点只改权重与激活的 "
@@ -77,7 +79,7 @@ class TaiYangH3FP16Turbo:
                                                           "（实测只有 fp16 的 1/10 速度），"
                                                           "只在排查数值问题时用。"}),
                 "量化权重": (WEIGHT_CHOICES, {"default": WEIGHT_CHOICES[0],
-                                            "tooltip": "其它全部转 FP16：只转 fp32 / bf16 的权重"
+                                            "tooltip": "BF16,FP32转为FP16：只转 fp32 / bf16 的权重"
                                                        "（video_patch_proj、time_embedder、"
                                                        "final video_out、adaln curves），"
                                                        "int8 / int4 / fp8 量化权重一个都不转，"
@@ -85,11 +87,11 @@ class TaiYangH3FP16Turbo:
                                                        "只在前向那一瞬间反量化成 FP16 喂张量核。"
                                                        "audio 专属的 audio_patch_proj 与 audio_out "
                                                        "保持原精度，防止失声/爆音。"
-                                                       "全部不转：连 fp32/bf16 也不动，"
-                                                       "直接吃 comfy_kitchen 的 int8 GEMM，"
-                                                       "更快但激活也会被量化成 int8。"
-                                                       "（后两项是旧版本的下拉名字，行为等同第一项，"
-                                                       "只为老工作流能正常加载而保留，可以忽略）"}),
+                                                       "全部权重转为FP16：连 int8 / int4 也 "
+                                                       "dequantize 成稠密 FP16 张量，"
+                                                       "权重占用约翻倍（H3 约 20GB → 40GB），"
+                                                       "24GB 卡选它一定 OOM，"
+                                                       "只有大显存或内存充足能 offload 的机器才吃得下。"}),
                 "数值保护": ("BOOLEAN", {"default": True,
                                        "label_on": "开（推荐）",
                                        "label_off": "关",

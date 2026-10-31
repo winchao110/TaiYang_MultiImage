@@ -4,14 +4,15 @@ MiniMax H3 的 supported_inference_dtypes 只有 [bf16, fp32]，整套模型原�
 「fp32 残差 + bf16 调制参数 + int8 权重 + 几处 fp32 岛」。本节点把它统一到
 目标精度（默认 FP16），让每个 Linear 都落在真张量核上：
 
-  ① 权重统一到 FP16（int8/int4 量化权重、audio 链路除外）
+  ① 权重统一到 FP16（audio 链路除外）
      int8/int4/fp8 量化权重保持存储形态（含 convrot，省显存），前向时按层反量化成
      FP16 送进张量核，用完即弃、不常驻；fp32 / bf16 的权重（H3 的几处 fp32 岛：
      video_patch_proj、time_embedder、FinalLayer.video_out、adaln curves）直接
      就地换成 FP16。audio 专属的两处（audio_patch_proj、FinalLayer.audio_out）
      保持 checkpoint 原精度，防止音频转半精度后失声/爆音。
-     也可以切到「全部不转」——连 fp32/bf16 都不动，权重直接走 comfy_kitchen
-     的 int8 GEMM（RTX 2080Ti 实测 int8 比 fp16 快约 1.7 倍，精度差一些）。
+     另一档「全部权重转为FP16」会把 int8/int4 也 dequantize 成稠密 FP16 张量，
+     权重占用直接翻倍（H3 约 20GB → 40GB），只有大显存、或内存充足且能 offload
+     的机器吃得下；普通 24GB 卡选它一定 OOM，默认请用第一档。
 
   ② Tensor Core 调度
      把 DiT 块内部所有矩阵乘的输入统一成 FP16（残差流仍是 FP32），这样每一个
@@ -57,16 +58,26 @@ PREC_BF16 = "BF16（H3 原生）"
 PREC_LEGACY_FP16 = "FP16（图灵张量核）"
 PRECISION_CHOICES = [PREC_FP16, PREC_BF16, PREC_LEGACY_FP16]
 
-# 名字必须一眼看出「int8/int4 是不转的」—— 之前叫「全部权重转 FP16」把人骗了。
-W_ALL = "其它全部转 FP16（int8/int4 不动）"
-W_KEEP_INT8 = "全部不转（fp32/bf16 也不动）"
-# 老工作流里存的是这两个旧字符串；留着只为让旧图能正常加载（ComfyUI 0.43 的
-# execution.py 会严格校验下拉值，不在列表里直接 value_not_in_list 报错）。
-# 它们的处理逻辑与 W_ALL 完全一致。
-W_LEGACY = "全部权重转 FP16"          # v1 的名字（有歧义的那个）
-W_LEGACY2 = "INT8 存储 + 动态转 FP16"  # v0 的名字
+# 两档权重策略：
+#   ① 只转非量化权重（fp32 / bf16 的岛），int8/int4 保持 int8 存储、前向那一瞬间
+#      才反量化成 FP16 —— 显存不变，推荐的默认档；
+#   ② 连 int8/int4 一起 dequantize 成稠密 FP16 —— 权重占用翻倍，24GB 卡会 OOM。
+W_ALL = "BF16,FP32转为FP16"
+W_EVERYTHING = "全部权重转为FP16"
+WEIGHT_CHOICES = [W_ALL, W_EVERYTHING]
+
+# 已下架的旧下拉值。ComfyUI 0.43 的 execution.py 会在校验阶段先按列表拦掉
+# （value_not_in_list），所以这里的映射主要是兜底：绕过前端校验的旧 prompt
+# 提交进来时，仍按当时的语义落到 W_ALL 上，不至于 KeyError。
+# 「全部不转（fp32/bf16 也不动）」原本走 comfy_kitchen 的 int8 GEMM，
+# 该档已按需求从列表移除，旧值一并落到 W_ALL。
+_WEIGHT_ALIASES = {
+    "其它全部转 FP16（int8/int4 不动）": W_ALL,   # v2 的名字
+    "全部权重转 FP16": W_ALL,                     # v1 的名字
+    "INT8 存储 + 动态转 FP16": W_ALL,             # v0 的名字
+    "全部不转（fp32/bf16 也不动）": W_ALL,        # 已下架的 int8 GEMM 档
+}
 W_DEQUANT = W_ALL  # 旧引用别名
-WEIGHT_CHOICES = [W_ALL, W_KEEP_INT8, W_LEGACY, W_LEGACY2]
 
 _TORCH_DTYPE = {
     PREC_FP16: torch.float16,
@@ -229,8 +240,42 @@ def _count_params(module):
     return sum(1 for p in module._parameters.values() if p is not None)
 
 
-def _cast_all_weights(diffusion_model, dtype, verbose=True):
-    """把模型里所有**非量化**参数统一成 dtype（精度选 FP16 时就是「统统转 FP16」）。
+def _expand_quantized(module, pname, param, dtype):
+    """把一条量化权重就地展开成稠密 dtype 张量，返回新张量字节数；失败返回 None。
+
+    展开后必须把 module.layout_type 清掉，否则 MixedPrecisionOps.forward 里的
+    `_use_quantized` 仍会为真，继续把这条已变成稠密张量的权重当量化的喂给
+    comfy_kitchen 的量化 GEMM，直接报错。
+    """
+    dense = None
+    for source in (param, getattr(param, "data", None)):
+        if source is None:
+            continue
+        dequant = getattr(source, "dequantize", None)
+        if dequant is None:
+            continue
+        try:
+            dense = dequant()
+        except Exception:
+            continue
+        break
+    if dense is None or not torch.is_tensor(dense):
+        return None
+    if dense.is_meta:
+        return None
+    if dense.dtype != dtype:
+        dense = dense.to(dtype)
+    module._parameters[pname] = torch.nn.Parameter(
+        dense.detach(), requires_grad=False
+    )
+    if pname == "weight":
+        module.layout_type = None
+    return dense.numel() * dense.element_size()
+
+
+def _cast_all_weights(diffusion_model, dtype, verbose=True,
+                      include_quantized=False, budget=CAST_BUDGET_BYTES):
+    """把模型里的参数统一成 dtype（精度选 FP16 时就是「统统转 FP16」）。
 
     H3 刻意留了几处 fp32 岛，`set_model_compute_dtype` 管不到它们：
       · video_patch_proj / audio_patch_proj
@@ -238,17 +283,23 @@ def _cast_all_weights(diffusion_model, dtype, verbose=True):
       · FinalLayer.video_out / audio_out（checkpoint 自带的 fp32 岛）
       · adaln curves 打开时的 AdalnProj
 
-    三条豁免（保持原 dtype）：
-      1. int8 / int4 / fp8 等量化权重 —— 继续「存量化、算 FP16」，显存不翻倍；
-      2. 名字里带 audio 的模块 —— audio_patch_proj、final_layer.audio_out。
+    include_quantized=False（W_ALL）：int8 / int4 / fp8 量化权重一律「存量化、
+    算 FP16」，显存不翻倍，前向时才由 cast_bias_weight 反量化。
+    include_quantized=True（W_EVERYTHING）：连量化权重也 dequantize 成稠密张量，
+    权重占用翻倍 —— 调用方要把 budget 传 None，否则会被预算中途截停，
+    留下「一半稠密一半量化」的混合状态。
+
+    固定豁免（保持原 dtype）：
+      1. 名字里带 audio 的模块 —— audio_patch_proj、final_layer.audio_out。
          音频链路对精度更敏感，怕转 FP16 出现失声/爆音，保持 checkpoint 原样；
          （block 里的 attn/mlp/adaln 是音视频共用的，不算 audio 专属，照常转）
-      3. 动态权重加载（aimdo vbar）托管的模块、meta 参数。
+      2. 动态权重加载（aimdo vbar）托管的模块、meta 参数。
 
     返回统计字典，供日志与 state() 使用。
     """
     stats = {
         "converted": 0, "converted_bytes": 0, "already": 0, "quantized": 0,
+        "expanded": 0, "expand_failed": 0,
         "audio": 0, "meta": 0, "vbar": 0, "budget_stop": False, "from": {},
     }
     for name, module in diffusion_model.named_modules():
@@ -268,13 +319,21 @@ def _cast_all_weights(diffusion_model, dtype, verbose=True):
                 stats["meta"] += 1
                 continue
             if _is_quantized_param(param, module, pname):
-                stats["quantized"] += 1
+                if not include_quantized:
+                    stats["quantized"] += 1
+                    continue
+                grown = _expand_quantized(module, pname, param, dtype)
+                if grown is None:
+                    stats["expand_failed"] += 1
+                    continue
+                stats["expanded"] += 1
+                stats["converted_bytes"] += grown
                 continue
             if param.dtype == dtype:
                 stats["already"] += 1
                 continue
             nbytes = param.numel() * param.element_size()
-            if stats["converted_bytes"] + nbytes > CAST_BUDGET_BYTES:
+            if budget is not None and stats["converted_bytes"] + nbytes > budget:
                 stats["budget_stop"] = True
                 continue
             module._parameters[pname] = torch.nn.Parameter(
@@ -297,7 +356,15 @@ def _format_cast(stats, dtype):
         text += "，原 " + "/".join(
             f"{k}×{v}" for k, v in sorted(stats["from"].items(), key=lambda kv: -kv[1])
         )
-    text += f"）｜本来就是 {target} {stats['already']} 个｜量化保留 {stats['quantized']} 个"
+    text += "）"
+    if stats["already"]:
+        text += f"｜本来就是 {target} {stats['already']} 个"
+    if stats["expanded"]:
+        text += f"｜量化权重已展开 {stats['expanded']} 个"
+    if stats["quantized"]:
+        text += f"｜量化保留 {stats['quantized']} 个"
+    if stats["expand_failed"]:
+        text += f"｜⚠ 量化展开失败 {stats['expand_failed']} 个（保持量化存储）"
     if stats["audio"]:
         text += f"｜audio 保持原精度 {stats['audio']} 个"
     if stats["vbar"]:
@@ -379,8 +446,9 @@ def apply(model, precision=PREC_FP16, weights=W_DEQUANT, numeric_guard=True, ver
     # 老工作流存下来的旧下拉字符串，先归一化再解析 dtype
     if precision == PREC_LEGACY_FP16:
         precision = PREC_FP16
-    if weights in (W_LEGACY, W_LEGACY2):
-        weights = W_ALL
+    if weights not in WEIGHT_CHOICES:
+        weights = _WEIGHT_ALIASES.get(weights, W_ALL)
+    expand_all = weights == W_EVERYTHING
 
     dtype = _torch_dtype(precision)
     use_fp16 = dtype == torch.float16
@@ -397,13 +465,27 @@ def apply(model, precision=PREC_FP16, weights=W_DEQUANT, numeric_guard=True, ver
 
     # ---- 1. 计算精度：manual_cast_dtype 决定整体 calc dtype
     patcher.set_model_compute_dtype(dtype)
-    if weights == W_KEEP_INT8:
-        # 保持 MixedPrecisionOps 的 int8 快路径：权重不反量化，直接进 int8 GEMM
-        patcher.force_cast_weights = False
+    if expand_all:
+        # 连 int8/int4 一起展开成稠密张量：预算必须放开，否则会被中途截停，
+        # 留下「一半稠密一半量化」的混合状态，比不转更糟。
+        if verbose:
+            logging.warning(
+                "%s 「%s」会把量化权重 dequantize 成稠密 %s，权重占用约翻倍"
+                "（H3 约 20GB → 40GB）。显存吃不住的机器请改用「%s」。",
+                _PREFIX, W_EVERYTHING, _dtype_label(dtype), W_ALL,
+            )
+        cast_stats = _cast_all_weights(
+            diffusion_model, dtype, verbose=verbose,
+            include_quantized=True, budget=None,
+        )
     else:
-        # 权重全转目标精度：fp32/bf16 的岛也一起换，int8/fp8 仍存量化形态
-        cast_stats = _cast_all_weights(diffusion_model, dtype, verbose=verbose)
-        _STATE["cast"] = cast_stats
+        # 只转目标精度里「本来不是这个精度」的那部分：fp32/bf16 的岛就地换掉，
+        # int8/int4/fp8 保持量化存储，交给 cast_bias_weight 在前向时反量化。
+        cast_stats = _cast_all_weights(
+            diffusion_model, dtype, verbose=verbose,
+            include_quantized=False, budget=CAST_BUDGET_BYTES,
+        )
+    _STATE["cast"] = cast_stats
 
     # ---- 2. 数值保护 + FP16 边界
     conflicts = _builtin_fix_present(diffusion_model)
@@ -452,8 +534,9 @@ def apply(model, precision=PREC_FP16, weights=W_DEQUANT, numeric_guard=True, ver
         backend = "FP16 张量核（HMMA）" if use_fp16 else "BF16（原生，无张量核加速）"
         target = _dtype_label(dtype)
         weight_desc = (
+            f"全部权重（含 int8/int4）展开为稠密 {target}，占用翻倍"
+            if expand_all else
             f"除 int8/int4 外统一 {target}（量化权重保持 int8 存储，前向才反量化）"
-            if weights != W_KEEP_INT8 else "全部不转：量化权重直接 int8 GEMM，fp32/bf16 保持原样"
         )
         logging.info(
             "%s 生效 | sm%d%d | 计算=%s | 权重=%s | 数值保护=%s | 块数=%d | "
