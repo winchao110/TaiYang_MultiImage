@@ -21,7 +21,7 @@
 
 from . import compiler_guard
 from .chunking import install as install_chunking
-from .fp16_turbo import PRECISION_CHOICES, WEIGHT_CHOICES, apply as apply_fp16_turbo
+from .fp16_turbo import PREC_FP16, WEIGHT_CHOICES, apply as apply_fp16_turbo
 
 _CATEGORY = "TaiYang"
 
@@ -30,7 +30,7 @@ class TaiYangH3FP16Turbo:
     """模型计算FP16：把非量化权重统一到目标精度，量化权重保持存储形态。"""
 
     DESCRIPTION = (
-        "把 H3 的权重统一到目标精度，让每个 Linear 都落在真张量核上。"
+        "把 H3 的权重统一到 FP16，让每个 Linear 都落在真张量核上。"
         "MiniMax H3 声明的推理 dtype 只有 bf16/fp32，原生跑的是"
         "「fp32 残差 + bf16 调制参数 + int8 权重 + 几处 fp32 岛」。本节点做三件事：\n"
         "① 权重统一（int8/int4 除外）：int8/int4 量化权重一个都不转，原地不动继续"
@@ -50,9 +50,7 @@ class TaiYangH3FP16Turbo:
         "int8/int4 仍以 int8 存储、前向那一瞬间才反量化，显存占用不变；"
         "「全部权重转为FP16」会把 int8/int4 也 dequantize 成稠密 FP16，"
         "权重占用约翻倍（H3 约 20GB → 40GB），24GB 卡选它一定 OOM，"
-        "只有大显存、或内存充足能 offload 的机器才吃得下。"
-        "计算精度也可切 BF16（本来就快 bf16 的卡上它才是首选；没有 bf16 张量核的卡上"
-        "会走模拟，最慢，仅在排查问题时用）。\n"
+        "只有大显存、或内存充足能 offload 的机器才吃得下。\n"
         "接法：模型 → 本节点 → 显存分块加载 / 注意力加速。本节点只改权重与激活的 "
         "dtype，不碰注意力内核，所以下游节点照常生效。\n"
         "注：本节点会在每个 block 内部动态申请/释放临时显存（FP32 残差 + 逐层反量化），"
@@ -69,15 +67,6 @@ class TaiYangH3FP16Turbo:
                                     "label_on": "开",
                                     "label_off": "关",
                                     "tooltip": "关掉立刻还原成原生（bf16 + int8 内核），模型原样往下传。"}),
-                "计算精度": (PRECISION_CHOICES, {"default": PRECISION_CHOICES[0],
-                                               "tooltip": "要转成哪个精度。只影响 fp32 / bf16 的权重，"
-                                                          "int8 / int4 量化权重永远不转。"
-                                                          "FP16：任何显卡都有硬件张量核的半精度格式，推荐。"
-                                                          "BF16：H3 的原生格式；有 bf16 张量核的卡"
-                                                          "（sm80 及以上）用它最合适，"
-                                                          "没有的卡上 bf16 GEMM 是模拟实现"
-                                                          "（实测只有 fp16 的 1/10 速度），"
-                                                          "只在排查数值问题时用。"}),
                 "量化权重": (WEIGHT_CHOICES, {"default": WEIGHT_CHOICES[0],
                                             "tooltip": "BF16,FP32转为FP16：只转 fp32 / bf16 的权重"
                                                        "（video_patch_proj、time_embedder、"
@@ -116,13 +105,13 @@ class TaiYangH3FP16Turbo:
         "模型计算FP16", "fp16", "half", "精度", "权重", "量化",
     ]
 
-    def apply(self, model, 启用, 计算精度, 量化权重, 数值保护, 显示信息):
+    def apply(self, model, 启用, 量化权重, 数值保护, 显示信息):
         if not 启用:
             compiler_guard.release("fp16_turbo")
             return (model,)
         return (apply_fp16_turbo(
             model,
-            precision=计算精度,
+            precision=PREC_FP16,   # 面板不再暴露精度选项，固定走 FP16
             weights=量化权重,
             numeric_guard=数值保护,
             verbose=显示信息,

@@ -53,6 +53,9 @@ CAST_BUDGET_BYTES = 1 << 30
 
 PREC_FP16 = "FP16（推荐）"
 PREC_BF16 = "BF16（H3 原生）"
+# 面板上的「计算精度」下拉已经撤掉，节点固定走 FP16（见 h3_nodes.apply）。
+# 下面这几个常量仍保留：apply() 的 precision 参数有默认值，脚本或别的节点
+# 直接调 fp16_turbo.apply 时还可以指定精度，不影响本包的 UI。
 # v1 的下拉值是「FP16（图灵张量核）」，老工作流存的就是它。ComfyUI 校验下拉值时会
 # 直接 value_not_in_list 报错，所以必须留在列表里（并且映射到同样的 float16）。
 PREC_LEGACY_FP16 = "FP16（图灵张量核）"
