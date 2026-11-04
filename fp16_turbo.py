@@ -29,10 +29,21 @@ MiniMax H3 的 supported_inference_dtypes 只有 [bf16, fp32]，整套模型原�
 
 接法：模型 → 本节点 → 显卡分块 / kitchen 注意力加速。本节点只改权重与激活的
 dtype，不碰注意力内核，所以下游节点照常生效。
+
+两处「只在本次前向生效」的全局东西
+----------------------------------
+① 显存编译图（aimdo malloc graph）：本节点在 block 内部动态申请临时显存，与「逐块
+   预编译分配计划」不兼容。v1 靠运行时翻转 `args.disable_comfy_compiler` 让路，那是
+   改整个进程 —— 之后重新 staging 的 int8 文本编码器会坏掉（convrot 反量化报
+   invalid argument），只能重启 ComfyUI。现在改成给顶层 forward 套一个线程局部作用域
+   （见 compiler_guard），前向一结束就恢复，进程里其它模型完全不受影响。
+② Tensor Core 开关（allow_fp16_accumulation 等）：也只在这次前向里生效，退出时按
+   原值还原，不会把「低精度累加」漏给后面的文本编码器 / VAE。
 """
 
 import logging
 import weakref
+from contextlib import contextmanager
 from types import MethodType
 
 import torch
@@ -408,7 +419,11 @@ def _format_quant(formats):
 
 
 def _tune_matmul():
-    """把能省的精度开关都打开；只动对当前架构没有副作用的项。"""
+    """把能省的精度开关都打开；只动对当前架构没有副作用的项。
+
+    返回「相对默认值被改动的项」，供日志使用。注意：这里**不真正改**全局开关，
+    真正的开关由 _matmul_scope() 在每次前向进出时套上/还原，避免漏给别的模型。
+    """
     changed = []
     flags = [
         ("allow_fp16_reduced_precision_reduction", True),
@@ -418,9 +433,53 @@ def _tune_matmul():
         if not hasattr(torch.backends.cuda.matmul, name):
             continue
         if getattr(torch.backends.cuda.matmul, name) != value:
-            setattr(torch.backends.cuda.matmul, name, value)
             changed.append(name)
     return changed
+
+
+@contextmanager
+def _matmul_scope(enabled):
+    """在本次前向里打开 FP16 累加开关，退出时逐项还原成进入前的值。"""
+    saved = []
+    if enabled:
+        for name, value in (
+            ("allow_fp16_reduced_precision_reduction", True),
+            ("allow_fp16_accumulation", True),
+        ):
+            backend = torch.backends.cuda.matmul
+            if not hasattr(backend, name):
+                continue
+            previous = getattr(backend, name)
+            if previous == value:
+                continue
+            try:
+                setattr(backend, name, value)
+            except Exception:
+                continue
+            saved.append((name, previous))
+    try:
+        yield
+    finally:
+        for name, previous in saved:
+            try:
+                setattr(torch.backends.cuda.matmul, name, previous)
+            except Exception:
+                pass
+
+
+def _model_forward(original, tune):
+    """顶层前向：套上「让出显存编译图」的作用域 + FP16 累加开关。
+
+    必须包在顶层（而不是只包 block）：malloc_graph_begin / malloc_graph_end 在
+    MiniMaxH3Model.forward 里，且 compile_allocations 只在开头取一次。
+    """
+    def forward(self, *args, **kwargs):
+        with compiler_guard.scope(), _matmul_scope(tune):
+            return original(*args, **kwargs)
+
+    setattr(forward, compiler_guard.SCOPE_MARK, True)
+    setattr(forward, "__name__", "forward")
+    return forward
 
 
 # ---------------------------------------------------------------- 主入口
@@ -444,6 +503,8 @@ def apply(model, precision=PREC_FP16, weights=W_DEQUANT, numeric_guard=True, ver
 
     # 本节点在每个 block 内部动态申请/释放临时显存（FP32 残差、逐层反量化权重），
     # 与 ComfyUI 0.43 的 aimdo 显存编译图（逐块预编译分配计划）本质冲突，必须让路。
+    # 注意：这里只登记 + 在下面给顶层 forward 套作用域，**绝不**翻转全局命令行开关
+    # （翻转会让之后重新 staging 的 int8 文本编码器坏掉，只能重启 ComfyUI）。
     compiler_guard.request("fp16_turbo")
 
     # 老工作流存下来的旧下拉字符串，先归一化再解析 dtype
@@ -528,7 +589,15 @@ def apply(model, precision=PREC_FP16, weights=W_DEQUANT, numeric_guard=True, ver
             _bind(block, _block_forward(block.forward, guard)),
         )
 
-    # ---- 3. Tensor Core 调度
+    # ---- 3. 顶层前向：显存编译图按次让路 + Tensor Core 开关
+    # 必须包在 MiniMaxH3Model.forward 这一层：malloc_graph_begin / malloc_graph_end
+    # 在那里，compile_allocations 也只在开头取一次，只包 block 拦不住它。
+    previous_forward = compiler_guard.pending_forward(patcher, diffusion_model)
+    if not getattr(previous_forward, compiler_guard.SCOPE_MARK, False):
+        patcher.add_object_patch(
+            "diffusion_model.forward",
+            _bind(diffusion_model, _model_forward(previous_forward, use_fp16)),
+        )
     changed = _tune_matmul() if use_fp16 else []
 
     # ---- 4. 日志

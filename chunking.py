@@ -688,6 +688,11 @@ def install(
             )
             installed["out_proj"] += 1
 
+    # 顶层前向套一层线程局部作用域：只在这一个模型前向里让出显存编译图，
+    # 前向结束立刻恢复（不再翻转全局的 --disable-comfy-compiler）。
+    if compiler_guard.arm(patched, diffusion):
+        _LOG.debug("%s 顶层前向已套「让出显存编译图」作用域", _PREFIX)
+
     if skipped_qkv:
         _warn_once(
             "qkv-skip",

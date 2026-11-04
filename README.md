@@ -37,9 +37,14 @@
 
 > **节点 7 / 8 与显存编译图**：这两个节点会在每个 block 内部动态申请临时显存（FP32 残差、
 > 逐层反量化权重、分块缓冲），和 ComfyUI 0.43 的 aimdo 逐块预编译分配计划本质冲突，
-> 不处理的话第二遍采样会抛 `aimdo memory compile error`。所以只要它们有一个开着，
-> 本包会在运行时打开 `--disable-comfy-compiler`（只停显存分配计划，动态显存加载 /
-> 权重流式加载 / 预取队列全部保留）；两个都关掉自动恢复。两者都不绑定显卡型号。
+> 不处理的话第二遍采样会抛 `aimdo memory compile error`。处理方式是给**本模型的顶层前向**
+> 套一层线程局部作用域（`compiler_guard.py`）：只在那一次前向里让分配计划让路，前向一结束
+> 立刻恢复，**不改任何全局命令行开关**。所以文本编码器、VAE、其它工作流都不受影响。两者都不绑定显卡型号。
+>
+> 早先的 v1 是运行时把 `--disable-comfy-compiler` 置为全局 True，副作用很大：开关翻转之后
+> 再重新 staging 的 int8 文本编码器会坏掉（`CUDA INT8 convrot dequantization failed:
+> invalid argument`），而且不会自愈，只能重启 ComfyUI —— 表现就是「跑完节点 7、再跑别的
+> 工作流就报错」。v2 已彻底改掉，升级后无需重启续命。
 
 ---
 

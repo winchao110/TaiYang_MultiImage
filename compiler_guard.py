@@ -1,112 +1,217 @@
-"""与 ComfyUI 0.43+ 的「显存编译图」（aimdo malloc graph）互斥。
+"""与 ComfyUI 0.43+ 的「显存编译图」（aimdo malloc graph）互斥 —— 只在本模型前向的这一瞬间让路。
 
-为什么要这一步
---------------
-ComfyUI 0.43 起，CUDA 上跑模型时会开一个 malloc graph：
+为什么要让路
+------------
+ComfyUI 0.43 起，CUDA 上跑模型时会开一张 malloc graph：
 
-    comfy/ldm/minimax/model.py:622   malloc_graph_begin(device)
-    comfy/ldm/minimax/model.py:761   prefetch_queue_pop(..., malloc_scope="block")
-    comfy/model_prefetch.py:210      malloc_graph.iterate("block")
+    comfy/ldm/minimax/model.py    malloc_graph_begin(device)
+    comfy/model_prefetch.py       prefetch_queue_pop(..., malloc_scope="block")
 
 它对每个 block 记录一遍 cudaMallocAsync 的申请/释放序列，编译成一份分配计划，
 下一步照计划预占显存。前提是**块内的分配序列逐步完全一致**。
 
-本包的两个节点（模型计算FP16 / H3 激活分块）恰好都破坏这个前提：
-
-  · FP16 加速：残差流每块转 FP32、每层把 int8 权重反量化成 FP16（32 MiB/层 × 200 层）；
-  · H3 激活分块：按 token 段申请 QKV/MLP 缓冲，最后一段长度与整段不同。
-
-第一遍（Model Initializing，即 warmup）能录进计划，第二遍真实采样时这些临时块
-被 PyTorch 缓存复用后再释放，与新建的计划对不上，aimdo 的 DLL 直接返回失败：
+本包的两个节点（模型计算FP16 / 显存分块加载）恰好都破坏这个前提：
+残差流每块转 FP32、每层把 int8 权重反量化成 FP16（32 MiB/层）、按 token 段申请缓冲。
+第二遍真实采样时这些临时块被 PyTorch 缓存复用后再释放，与计划对不上，aimdo 的 DLL
+直接返回失败：
 
     RuntimeError: aimdo memory compile error
 
-这不是数值问题，也不是我们算错了，是「逐块预编译分配计划」这个优化与
-「块内动态申请临时显存」本质冲突。
+v1 的做法与它的两个坑
+--------------------
+v1 是运行时把命令行开关 `args.disable_comfy_compiler` 置 True，等节点被关掉再还原。
+这有两个问题：
 
-处理方式
---------
-启用这两个节点时，把 ComfyUI 自带的命令行开关 `--disable-comfy-compiler` 在运行时打开
-（`args.disable_comfy_compiler = True`）。它的唯一作用就是让
-`comfy.model_prefetch.malloc_graph_enabled()` 返回 False，也就是：
-不再录/不再编译分配计划，其余（aimdo 动态显存 vbar、权重流式加载、预取队列）都不受影响。
+  1. 它改的是**整个进程**。开关一翻，之后所有模型（包括 25 GB 的 int8 文本编码器）
+     都按「无分配计划」重新 staging。2080 Ti 上实测：文本编码器在开关翻转之后重新
+     staging，会把 int8 convrot 反量化用的 vbar 映射搞坏，下一次前向直接
+         RuntimeError: CUDA INT8 convrot dequantization failed: invalid argument
+     而且这个坑不会自己好，只能重启 ComfyUI —— 也就是「跑完这个节点、再跑别的工作流
+     就报错，必须重启」的真正原因。
+  2. 节点一旦从工作流里拿掉，release() 永远不会被调用，开关就永久留在 True。
 
-多个节点可能同时要这个开关，所以用引用计数；节点关掉时归还，没人要了就恢复原值。
+v2 的做法：按次作用域，一个全局开关都不碰
+----------------------------------------
+钩住 `comfy.model_prefetch.malloc_graph_enabled()` 与 `prefetch_queue_pop()`，
+用一个**线程局部的深度计数**，只在本模型 forward 的调用栈里返回 False / 清掉
+malloc_scope。`MiniMaxH3Model.forward` 开头那一句
+
+    compile_allocations = comfy.model_prefetch.malloc_graph_enabled(x[0].device)
+
+拿到 False 就整条走原生路径（不 begin、不 copy 到预分配缓冲、block 作用域也不
+iterate），效果与 `--disable-comfy-compiler` 对这**一次**前向完全等价；前向一结束
+立刻恢复，进程里其它模型（文本编码器、VAE、别的工作流）一个字节都不受影响。
+
+钩子是进程级的，但只在作用域内生效。和 minimax-h3-chunk-star7 的同类钩子**可以叠加**：
+各自查各自的线程局部深度，谁都顶不掉谁（我们包装的是当时的函数对象，链式调用）。
 """
 
 import logging
+import threading
+import weakref
+from contextlib import contextmanager
+from types import MethodType
 
 _PREFIX = "[H3显存编译图]"
+
+# 打在「已套过作用域」的 forward 上的标记，避免两个节点重复包一层
+SCOPE_MARK = "_taiyang_graph_scope"
+
 _OWNERS = set()
-_SAVED = None
+_TLS = threading.local()
+_HOOKS_INSTALLED = False
 
 
-def _cli_args():
-    try:
-        from comfy.cli_args import args
-    except Exception:
-        return None
-    return args
+# ---------------------------------------------------------------- 线程局部开关
 
 
-def _graph_active():
-    """当前线程是否已经有一张在用的编译图（一般不会，节点执行时还没开始前向）。"""
+def _depth():
+    return getattr(_TLS, "depth", 0)
+
+
+def _prefetch_module():
+    """延迟导入：ComfyUI 还没加载完时不能碰 comfy.model_prefetch。"""
     try:
         import comfy.model_prefetch as prefetch
-
-        return bool(getattr(prefetch, "MALLOC_GRAPHS", None))
     except Exception:
+        return None
+    return prefetch
+
+
+def _install_hooks():
+    """装一次进程级钩子（幂等）。返回当前 ComfyUI 是否支持按次让路。"""
+    global _HOOKS_INSTALLED
+    if _HOOKS_INSTALLED:
+        return True
+
+    prefetch = _prefetch_module()
+    if prefetch is None:
         return False
 
-
-def request(owner):
-    """声明 owner 需要在块内动态分配显存 → 关掉显存编译图。返回是否发生了改动。"""
-    global _SAVED
-
-    if owner in _OWNERS:
-        return False
-    args = _cli_args()
-    if args is None or not hasattr(args, "disable_comfy_compiler"):
-        # 老版本 ComfyUI 没有这个特性，什么都不用做
+    enabled_fn = getattr(prefetch, "malloc_graph_enabled", None)
+    pop_fn = getattr(prefetch, "prefetch_queue_pop", None)
+    if not callable(enabled_fn) or not callable(pop_fn):
+        # 老版本 ComfyUI 没有显存编译图，不需要让路
         return False
 
-    _OWNERS.add(owner)
-    if getattr(args, "disable_comfy_compiler", False):
-        # 用户自己就在用 --disable-comfy-compiler，不重复处理
-        return False
+    if getattr(enabled_fn, SCOPE_MARK, False):
+        _HOOKS_INSTALLED = True
+        return True
 
-    _SAVED = False
-    args.disable_comfy_compiler = True
-    logging.info(
-        "%s 已关闭 ComfyUI 显存编译图（aimdo malloc graph）。原因：这两个节点会在每个 block 内部"
-        "动态申请/释放临时显存（FP32 残差、逐层反量化权重、分块缓冲），与逐块预编译的分配计划"
-        "不兼容，强行录制会报 aimdo memory compile error。动态显存加载、权重流式加载、"
-        "预取队列都不受影响；节点全部关掉后自动恢复。",
-        _PREFIX,
-    )
-    if _graph_active():
-        logging.info("%s 检测到已有编译图在册，下一次前向起不再录制。", _PREFIX)
+    def malloc_graph_enabled_scoped(device):
+        if _depth():
+            return False
+        return enabled_fn(device)
+
+    def prefetch_queue_pop_scoped(
+        queue, device, module, dtype=None, core=None, enable_graph=False,
+        generator=None, malloc_scope=None, **kwargs,
+    ):
+        # 只掐「逐块分配计划」这一路：队列消费、VBAR 取权重、预取全部保留，
+        # 其它作用域（模型级 scope）和别的模型照常。
+        if _depth() and malloc_scope is not None:
+            malloc_scope = None
+        return pop_fn(
+            queue, device, module, dtype=dtype, core=core,
+            enable_graph=enable_graph, generator=generator,
+            malloc_scope=malloc_scope, **kwargs,
+        )
+
+    setattr(malloc_graph_enabled_scoped, SCOPE_MARK, True)
+    setattr(prefetch_queue_pop_scoped, SCOPE_MARK, True)
+    prefetch.malloc_graph_enabled = malloc_graph_enabled_scoped
+    prefetch.prefetch_queue_pop = prefetch_queue_pop_scoped
+    _HOOKS_INSTALLED = True
     return True
 
 
-def release(owner):
-    """owner 关闭时归还开关；所有 owner 都归还后恢复命令行原值。"""
-    global _SAVED
+@contextmanager
+def scope():
+    """在这个 with 块里，当前线程不录、也不重放显存分配计划。"""
+    _install_hooks()
+    _TLS.depth = _depth() + 1
+    try:
+        yield
+    finally:
+        _TLS.depth = max(0, _depth() - 1)
 
+
+# ---------------------------------------------------------------- 给模型前向套作用域
+
+
+def pending_forward(patcher, module):
+    """取「下一次 patch_model 真正会用到」的 forward。
+
+    add_object_patch 只是登记，不会立刻 setattr，所以这里要先看登记表，
+    否则会把上一个节点布好的补丁绕过去。
+    """
+    pending = patcher.object_patches.get("diffusion_model.forward")
+    if pending is not None:
+        return pending
+    return module.forward
+
+
+def bind(module, function):
+    """用弱引用持有模块，避免旧模型被补丁吊住不放。"""
+    return MethodType(function, weakref.proxy(module))
+
+
+def arm(patcher, module=None):
+    """给 patcher 的顶层前向套一层「关掉显存编译图」的作用域。
+
+    幂等：上游节点已经套过（带 SCOPE_MARK）就直接跳过，不会叠两层。
+    """
+    if not _install_hooks():
+        return False
+
+    if module is None:
+        try:
+            module = patcher.get_model_object("diffusion_model")
+        except Exception:
+            return False
+
+    current = pending_forward(patcher, module)
+    if getattr(current, SCOPE_MARK, False):
+        return False
+
+    def forward(self, *args, **kwargs):
+        with scope():
+            return current(*args, **kwargs)
+
+    setattr(forward, SCOPE_MARK, True)
+    setattr(forward, "__name__", getattr(current, "__name__", "forward"))
+    patcher.add_object_patch("diffusion_model.forward", bind(module, forward))
+    return True
+
+
+# ---------------------------------------------------------------- 对外状态（兼容旧接口）
+
+
+def request(owner):
+    """登记一个需要让路的节点。只做记账与日志，不改任何全局开关。"""
+    if owner in _OWNERS:
+        return False
+    _OWNERS.add(owner)
+    ok = _install_hooks()
+    if ok:
+        logging.info(
+            "%s 已登记「%s」：本节点会在自己的模型前向里临时让出显存编译图"
+            "（aimdo malloc graph），前向一结束立刻恢复；全局命令行开关不动，"
+            "文本编码器 / VAE / 其它工作流完全不受影响。",
+            _PREFIX, owner,
+        )
+    else:
+        logging.debug("%s 当前 ComfyUI 没有显存编译图，无需让路。", _PREFIX)
+    return ok
+
+
+def release(owner):
+    """注销登记（节点被关掉时调用）。作用域本来就是按次生效，这里只更新状态。"""
     if owner not in _OWNERS:
         return False
     _OWNERS.discard(owner)
-    if _OWNERS:
-        return False
-
-    args = _cli_args()
-    if args is None or _SAVED is None:
-        return False
-    args.disable_comfy_compiler = _SAVED
-    _SAVED = None
-    logging.info("%s 这两个节点已全部关闭，显存编译图开关恢复为命令行原值。", _PREFIX)
     return True
 
 
 def state():
-    return {"owners": sorted(_OWNERS), "saved": _SAVED}
+    return {"owners": sorted(_OWNERS), "hooks": _HOOKS_INSTALLED, "depth": _depth()}
