@@ -16,3 +16,8 @@ desktop.ini
 # 测试/临时产物
 *.new.json
 _probe_*.js
+
+# 本地改文件时的备份
+*.bak
+*.bak.*
+*.fix*

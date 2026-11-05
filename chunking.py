@@ -692,6 +692,11 @@ def install(
     # 前向结束立刻恢复（不再翻转全局的 --disable-comfy-compiler）。
     if compiler_guard.arm(patched, diffusion):
         _LOG.debug("%s 顶层前向已套「让出显存编译图」作用域", _PREFIX)
+    else:
+        compiler_guard._diag(
+            "chunk arm 未套作用域：diffusion=id(%s) blocks0=id(%s)",
+            id(diffusion), id(blocks[0]) if blocks else None,
+        )
 
     if skipped_qkv:
         _warn_once(

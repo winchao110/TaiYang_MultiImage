@@ -592,12 +592,31 @@ def apply(model, precision=PREC_FP16, weights=W_DEQUANT, numeric_guard=True, ver
     # ---- 3. 顶层前向：显存编译图按次让路 + Tensor Core 开关
     # 必须包在 MiniMaxH3Model.forward 这一层：malloc_graph_begin / malloc_graph_end
     # 在那里，compile_allocations 也只在开头取一次，只包 block 拦不住它。
-    previous_forward = compiler_guard.pending_forward(patcher, diffusion_model)
-    if not getattr(previous_forward, compiler_guard.SCOPE_MARK, False):
-        patcher.add_object_patch(
-            "diffusion_model.forward",
-            _bind(diffusion_model, _model_forward(previous_forward, use_fp16)),
-        )
+    #
+    # 判断依据必须是「模型上此刻真正挂着的 forward」，不能看补丁登记表：
+    # 上一轮跑完 unpatch_model 会把 forward 还原成原生，但登记表里还留着旧包装，
+    # 照着登记表判断就会以为「已经套过了」而跳过，这一轮作用域根本没进，直接崩。
+    live = compiler_guard.live_forward(diffusion_model)
+    _blocks = getattr(diffusion_model, "blocks", None)
+    compiler_guard._diag(
+        "fp16 apply：diffusion=id(%s) blocks0=id(%s) live=%s live_mark=%s "
+        "pending_mark=%s object_patches=%d",
+        id(diffusion_model), id(_blocks[0]) if _blocks else None,
+        type(live).__name__,
+        getattr(live, compiler_guard.SCOPE_MARK, False),
+        getattr(compiler_guard.pending_forward(patcher, diffusion_model),
+                compiler_guard.SCOPE_MARK, False),
+        len(patcher.object_patches),
+    )
+    if getattr(live, compiler_guard.SCOPE_MARK, False) and getattr(live, "_taiyang_fp16_pack", False):
+        # 本进程里已经装过我们这一层（同一模型被重复 apply），不必再包
+        compiler_guard._diag("fp16 跳过顶层包装：实机 forward 已是我们自己的包装")
+    else:
+        # live 可能已经是别的节点（显存分块）套的作用域，也可能就是原生 forward；
+        # 两种情况都直接往上包，作用域嵌套是幂等的（内层 depth>0 不会再让路）。
+        wrapped = _model_forward(live, use_fp16)
+        setattr(wrapped, "_taiyang_fp16_pack", True)
+        compiler_guard.install_forward(patcher, diffusion_model, _bind(diffusion_model, wrapped))
     changed = _tune_matmul() if use_fp16 else []
 
     # ---- 4. 日志

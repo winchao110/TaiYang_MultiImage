@@ -61,6 +61,14 @@ _OWNERS = set()
 _TLS = threading.local()
 _HOOKS_INSTALLED = False
 
+# ---- 诊断开关（排查「让路作用域为何没生效」时置 True，平时保持关闭）----
+_DIAG = False
+
+
+def _diag(msg, *a):
+    if _DIAG:
+        logging.info("[H3诊断] " + msg, *a)
+
 
 # ---------------------------------------------------------------- 线程局部开关
 
@@ -111,6 +119,16 @@ def _install_hooks():
         # 其它作用域（模型级 scope）和别的模型照常。
         if _depth() and malloc_scope is not None:
             malloc_scope = None
+        elif malloc_scope == "block":
+            # 诊断：本应在「让路作用域」里，但 _depth()==0 —— 说明包装没套上
+            n = getattr(_TLS, "diag_blocks", 0)
+            if n < 3:
+                _TLS.diag_blocks = n + 1
+                _diag(
+                    "逐块分配计划未被让路 depth=0 scope=%r module=%s id=%s",
+                    malloc_scope, type(module).__name__ if module is not None else "None",
+                    id(module) if module is not None else "None",
+                )
         return pop_fn(
             queue, device, module, dtype=dtype, core=core,
             enable_graph=enable_graph, generator=generator,
@@ -129,11 +147,17 @@ def _install_hooks():
 def scope():
     """在这个 with 块里，当前线程不录、也不重放显存分配计划。"""
     _install_hooks()
+    outer = _depth() == 0
     _TLS.depth = _depth() + 1
+    if outer:
+        _TLS.diag_blocks = 0
+        _diag("让路作用域进入 tid=%s", threading.get_ident())
     try:
         yield
     finally:
         _TLS.depth = max(0, _depth() - 1)
+        if outer:
+            _diag("让路作用域退出 tid=%s", threading.get_ident())
 
 
 # ---------------------------------------------------------------- 给模型前向套作用域
@@ -144,11 +168,62 @@ def pending_forward(patcher, module):
 
     add_object_patch 只是登记，不会立刻 setattr，所以这里要先看登记表，
     否则会把上一个节点布好的补丁绕过去。
+
+    注意：这个函数**只反映登记表**，不反映模型上此刻真正挂着的东西。
+    判断「作用域有没有生效」必须用下面的 live_forward()。
     """
     pending = patcher.object_patches.get("diffusion_model.forward")
     if pending is not None:
         return pending
     return module.forward
+
+
+def live_forward(module):
+    """模型对象上「此刻真正会被调到」的 forward。
+
+    上一轮跑完时 unpatch_model() 会把 object_patches_backup 里的原始 forward
+    还原回模型，并把备份表清空；但 object_patches **登记表还留着旧包装**。
+    于是新 patcher（model.clone() 会连 object_patches 一起复制）里那条记录
+    带着作用域标记，可模型上挂的已经不是它了 —— 只看登记表就会误判「已套过」
+    而跳过安装，这一轮采样走的原生 forward，逐块分配计划照旧执行，
+    malloc_graph_pop 返回 0，直接 aimdo memory compile error。
+    """
+    return getattr(module, "forward", None)
+
+
+def install_forward(patcher, root, wrapped, full_key="diffusion_model.forward", rel_key="forward"):
+    """登记补丁，并保证「当前这一刻」模型上挂的就是它。
+
+    add_object_patch 只在下次 patch_model 时 setattr。如果模型已经处于
+    patch 状态（上一轮跑完、forward 被还原成原生），光登记不会立刻生效，
+    所以这里补一次即时 setattr，把备份补上，unpatch 时照旧能还原。
+    """
+    patcher.add_object_patch(full_key, wrapped)
+
+    target = root
+    parts = rel_key.split(".")
+    for name in parts[:-1]:
+        target = getattr(target, name, None)
+        if target is None:
+            return False
+    attr = parts[-1]
+
+    try:
+        current = getattr(target, attr)
+    except AttributeError:
+        current = None
+
+    if current is wrapped:
+        return True
+
+    try:
+        if full_key not in patcher.object_patches_backup:
+            patcher.object_patches_backup[full_key] = current
+        setattr(target, attr, wrapped)
+        _diag("install 即时挂载 %s（登记表与实机不一致，已补齐）", full_key)
+    except Exception as exc:
+        _diag("install 即时挂载失败 %s（%r），只能等下次 patch_model", full_key, exc)
+    return True
 
 
 def bind(module, function):
@@ -170,8 +245,9 @@ def arm(patcher, module=None):
         except Exception:
             return False
 
-    current = pending_forward(patcher, module)
+    current = live_forward(module)
     if getattr(current, SCOPE_MARK, False):
+        _diag("arm 跳过：实机 forward 已有作用域标记")
         return False
 
     def forward(self, *args, **kwargs):
@@ -180,7 +256,11 @@ def arm(patcher, module=None):
 
     setattr(forward, SCOPE_MARK, True)
     setattr(forward, "__name__", getattr(current, "__name__", "forward"))
-    patcher.add_object_patch("diffusion_model.forward", bind(module, forward))
+    install_forward(patcher, module, bind(module, forward))
+    _diag(
+        "arm 已套作用域：diffusion=id(%s) current=%s mark=%s",
+        id(module), type(current).__name__, getattr(current, SCOPE_MARK, False),
+    )
     return True
 
 
