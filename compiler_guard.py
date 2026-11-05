@@ -49,7 +49,7 @@ iterate），效果与 `--disable-comfy-compiler` 对这**一次**前向完全�
 import logging
 import threading
 import weakref
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from types import MethodType
 
 _PREFIX = "[H3显存编译图]"
@@ -232,9 +232,9 @@ def bind(module, function):
 
 
 def arm(patcher, module=None):
-    """给 patcher 的顶层前向套一层「关掉显存编译图」的作用域。
+    """给模型前向套一层「关掉显存编译图」的作用域。
 
-    幂等：上游节点已经套过（带 SCOPE_MARK）就直接跳过，不会叠两层。
+    幂等：上游节点已经套过就直接跳过，不会叠两层。
     """
     if not _install_hooks():
         return False
@@ -245,22 +245,69 @@ def arm(patcher, module=None):
         except Exception:
             return False
 
-    current = live_forward(module)
-    if getattr(current, SCOPE_MARK, False):
-        _diag("arm 跳过：实机 forward 已有作用域标记")
+    return arm_class(module)
+
+
+# ---------------------------------------------------------------- 类级补丁
+#
+# 为什么不用 add_object_patch 装作用域
+# ----------------------------------
+# 那条路要经过 ModelPatcher 的 patch/unpatch 生命周期：unpatch_model() 会把
+# forward 还原、清空 object_patches_backup，而 patch_model() 在模型已经处于
+# patch 状态时不一定会重新 setattr。实测两轮里同一份代码，第一轮装上了、
+# 第二轮就是没装上（日志 depth=0），靠推断没法保证下一次一定生效。
+#
+# 类上打补丁不参与这套生命周期：unpatch 不会碰它、clone 也不会丢，
+# 只要进程里还有 TaiYang 节点启用（_OWNERS 非空）就恒生效。
+
+_CLASS_EXTRA = {}          # owner -> contextmanager 工厂（FP16 累加开关等）
+
+
+def arm_class(model, owner=None, extra=None):
+    """在模型类上打一层 forward 补丁，让前向一定落进让路作用域。
+
+    owner: 登记名（与 request() 一致），作用域外的东西按它生效/失效
+    extra: 无参可调用，返回一个 contextmanager（例如 FP16 累加开关）
+    """
+    if owner is not None and extra is not None:
+        _CLASS_EXTRA[owner] = extra
+
+    cls = type(model)
+    # 实例上若残留旧包装，会盖住类方法，先摘掉（旧包装内部指向的也是同一个原始
+    # forward，摘掉不会丢行为）。
+    if "forward" in getattr(model, "__dict__", {}):
+        try:
+            del model.__dict__["forward"]
+        except Exception:
+            pass
+
+    if getattr(cls, "_taiyang_class_scoped", False):
+        _diag("arm_class 跳过：类已打过补丁（%s）", cls.__name__)
         return False
 
-    def forward(self, *args, **kwargs):
-        with scope():
-            return current(*args, **kwargs)
+    original = cls.forward
 
+    def forward(self, *args, **kwargs):
+        if not _OWNERS:
+            return original(self, *args, **kwargs)
+        with scope():
+            if not _CLASS_EXTRA:
+                return original(self, *args, **kwargs)
+            with ExitStack() as stack:
+                for name, factory in list(_CLASS_EXTRA.items()):
+                    if name not in _OWNERS:
+                        continue
+                    try:
+                        stack.enter_context(factory())
+                    except Exception:
+                        pass
+                return original(self, *args, **kwargs)
+
+    forward.__name__ = getattr(original, "__name__", "forward")
     setattr(forward, SCOPE_MARK, True)
-    setattr(forward, "__name__", getattr(current, "__name__", "forward"))
-    install_forward(patcher, module, bind(module, forward))
-    _diag(
-        "arm 已套作用域：diffusion=id(%s) current=%s mark=%s",
-        id(module), type(current).__name__, getattr(current, SCOPE_MARK, False),
-    )
+    cls.forward = forward
+    cls._taiyang_class_scoped = True
+    _diag("arm_class 已装：%s forward 现在恒进让路作用域", cls.__name__)
     return True
 
 
